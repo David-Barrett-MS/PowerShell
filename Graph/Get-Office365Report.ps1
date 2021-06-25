@@ -7,9 +7,9 @@
     [ValidateNotNullOrEmpty()]
     [string]$AppSecretKey = "",
 
-	[Parameter(Mandatory=$True,HelpMessage="Tenant domain")]
-	[ValidateNotNullOrEmpty()]
-	[string]$TenantDomain,
+    [Parameter(Mandatory=$True,HelpMessage="Tenant domain")]
+    [ValidateNotNullOrEmpty()]
+    [string]$TenantDomain,
 
     [Parameter(Mandatory=$False,HelpMessage="Name of the report to retrieve")]
     [ValidateNotNullOrEmpty()]
@@ -25,28 +25,26 @@
 )
 
 
-
+# Get token
 $Body = @{    
     Grant_Type    = "client_credentials"
     Scope         = "https://graph.microsoft.com/.default" 
     client_Id     = $AppId
     Client_Secret = $AppSecretKey
 } 
-
 $authResponse = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$TenantDomain/oauth2/v2.0/token" -Method POST -Body $Body -ErrorAction STOP
 
+# Get report
 $Headers = @{
     'Authorization' = "Bearer $($authResponse.access_token)"
 }
+$report = Invoke-RestMethod -Headers $Headers -Uri "https://graph.microsoft.com/v1.0/reports/$($ReportName)(period='$Period')" -Method Get
 
-$currentDate = get-date -Format d
-$currentDate = $currentDate.Replace('/','-')
-
-$apiUrl = "https://graph.microsoft.com/v1.0/reports/$($ReportName)(period='$Period')"
-$report = Invoke-RestMethod -Headers $Headers -Uri $apiUrl -Method Get
-
+# Output report
 if (![String]::IsNullOrEmpty($SavePath))
 {
+    $currentDate = get-date -Format d
+    $currentDate = $currentDate.Replace('/','-')
     $report | out-file -FilePath "$SavePath\$ReportName$currentDate.csv"
 }
 else
