@@ -15,7 +15,7 @@
     [ValidateNotNullOrEmpty()]
     [string]$ReportName = "getEmailActivityCounts",
 
-    [Parameter(Mandatory=$False,HelpMessage="Name of the report to retrieve")]
+    [Parameter(Mandatory=$False,HelpMessage="Period of the report to retrieve")]
     [ValidateNotNullOrEmpty()]
     [string]$Period = "D7",
     
