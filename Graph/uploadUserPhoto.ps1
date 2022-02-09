@@ -66,7 +66,7 @@ if ($Mailbox -eq "me")
     $graphUrl = "https://graph.microsoft.com/v1.0/me/photo/`$value"
 
     # Acquire auth code (needed to request token)
-    $authUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/authorize?client_id=$AppId&response_type=code&redirect_uri=$RedirectUrl&response_mode=query&scope=openid%20profile%20email%20offline_access%20$Scope"
+    $authUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/authorize?client_id=$AppId&response_type=code&redirect_uri=$RedirectUrl&response_mode=query&scope=openid%20profile%20email%20offline_access%20"
     Start-Process $authUrl
 
     Write-Host "Please complete log-in via the web browser, and then paste the redirect URL (including auth code) here to continue" -ForegroundColor Green
