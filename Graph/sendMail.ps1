@@ -45,7 +45,13 @@ param (
 
 	[Parameter(Mandatory=$False,HelpMessage="Mailbox")]
 	[ValidateNotNullOrEmpty()]
-	[string]$Mailbox
+	[string]$Mailbox,
+
+	[Parameter(Mandatory=$False,HelpMessage="If specified, this picture will be attached to the message.")]
+	[string]$AttachPicture,
+
+	[Parameter(Mandatory=$False,HelpMessage="If specified, this is the HTML body of the message.")]
+	[string]$MessageHTML
 )
 
 
@@ -68,25 +74,96 @@ Write-Host "Successfully obtained OAuth token" -ForegroundColor Green
 
 # Send message to the mailbox owner (i.e. send message to self)
 $createUrl = "$($graphUrl)sendMail"
+
+$attachmentJson = ""
+if (-not [String]::IsNullOrEmpty($AttachPicture))
+{
+    # Add attachment
+    $pictureType = $AttachPicture.Substring($AttachPicture.Length-3).ToLower()
+    if ($pictureType -ne "jpg" -and $pictureType -ne "png")
+    {
+        Write-Host "Attachment must be jpg or png." -ForegroundColor Red
+    }
+    else
+    {
+        $pictureFile = Get-Item $AttachPicture
+        if (!$pictureFile)
+        {
+            Write-Host "Failed to read picture: $AttachPicture" -ForegroundColor Red
+        }
+        else
+        {
+            # Read the byte data for the picture
+            Write-Host "Reading $($pictureFile.VersionInfo.FileName)" -ForegroundColor Green
+            $fileStream = New-Object -TypeName System.IO.FileStream -ArgumentList ($pictureFile.VersionInfo.FileName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+            $fileReader = New-Object -TypeName System.IO.BinaryReader -ArgumentList $fileStream
+            if (!$fileReader) { exit }
+
+            $pictureBytes = $fileReader.ReadBytes($pictureFile.Length)
+            $fileReader.Dispose()
+            $fileStream.Dispose()
+
+            # Convert the data into a Base64 string
+            $attachBytesBase64 = [Convert]::ToBase64String($pictureBytes)
+
+            # Add the attachment JSON
+            $attachmentJson = ",
+    ""attachments"": [
+      {
+        ""@odata.type"": ""#microsoft.graph.fileAttachment"",
+        ""name"": ""$($pictureFile.Name)"",
+        ""contentId"": ""image001.png@01D82E0D.6377FC90"",
+        ""contentType"": ""image/$pictureType"",
+        ""contentBytes"": ""$attachBytesBase64""
+      }
+    ]
+"
+            if ([String]::IsNullOrEmpty($MessageHTML))
+            {
+                # If no message HTML has been provided, we add some that will embed the image in the message body
+                $MessageHTML = "<html><body><p>This is the image: <img id='Picture_x0020_1' src='cid:image001.png@01D82E0D.6377FC90'></p></body></html>"
+            }
+        }
+    }
+}
+
+if ([String]::IsNullOrEmpty($MessageHTML))
+{
+    # No message HTML provided, so just use a text example
+    $bodyJson = """body"":{
+            ""contentType"":""Text"",
+            ""content"":""This is a test message sent using Graph sendMail.""
+        }"
+}
+else
+{
+    $bodyJson = """body"":{
+            ""contentType"":""HTML"",
+            ""content"":""$MessageHTML""
+        }"
+}
+
 $sendMessageJson = "
 {
     ""message"": {
         ""subject"":""Test Message"",
         ""importance"":""Low"",
-        ""body"":{
-            ""contentType"":""Text"",
-            ""content"":""This is a test message sent using Graph sendMail.""
-        },
+        $bodyJson,
         ""toRecipients"":[
             {
                 ""emailAddress"":{
                     ""address"":""$Mailbox""
                 }
             }
-        ]
-    },
+        ]"
+
+$sendMessageJson = "$sendMessageJson$attachmentJson"
+
+$sendMessageJson = "$sendMessageJson},
     ""saveToSentItems"": ""true""
 }"
+
+$sendMessageJson
 
 try
 {
