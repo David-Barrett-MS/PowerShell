@@ -14,7 +14,7 @@
 
 <#
 .SYNOPSIS
-Create a Draft message and add a large attachment.
+Create a Draft message and add one or multiple large attachments.
 
 .DESCRIPTION
 This script demonstrates how to create a draft message and add a large attachment using createUploadSession.
@@ -25,38 +25,40 @@ https://docs.microsoft.com/en-us/graph/api/attachment-createuploadsession
 
 #>
 
-
 param (
-	[Parameter(Mandatory=$False,HelpMessage="Application Id (obtained when registering the application in Azure AD")]
+	[Parameter(Mandatory=$False,HelpMessage="Application Id (obtained when registering the application in Azure AD).")]
 	[ValidateNotNullOrEmpty()]
 	[string]$AppId,
 
-	[Parameter(Mandatory=$False,HelpMessage="Application secret key (obtained when registering the application in Azure AD")]
+	[Parameter(Mandatory=$False,HelpMessage="Application secret key (obtained when registering the application in Azure AD).")]
 	[ValidateNotNullOrEmpty()]
 	[string]$AppSecretKey,
 
-	[Parameter(Mandatory=$False,HelpMessage="Tenant Id")]
+	[Parameter(Mandatory=$False,HelpMessage="Tenant Id.")]
 	[ValidateNotNullOrEmpty()]
 	[string]$TenantId,
 
-	[Parameter(Mandatory=$False,HelpMessage="Mailbox")]
+	[Parameter(Mandatory=$False,HelpMessage="Mailbox.")]
 	[ValidateNotNullOrEmpty()]
 	[string]$Mailbox,
 
-	[Parameter(Mandatory=$False,HelpMessage="Path to the file that will be attached")]
+	[Parameter(Mandatory=$False,HelpMessage="The file(s) that will be attached.")]
 	[ValidateNotNullOrEmpty()]
-    [string]$FileAttachment
+    $FileAttachments
 )
-
+$script:ScriptVersion = "1.0.1"
 
 $graphUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/"
 
-# Check the attachment is valid
-$attachmentFile = Get-Item $FileAttachment
-if (!$attachmentFile)
+# Validate the attachment(s)
+foreach ($filePath in $FileAttachments)
 {
-    Write-Host "Failed to locate attachment: $FileAttachment" -ForegroundColor Red
-    exit
+    $attachmentFile = Get-Item $filePath
+    if (!$attachmentFile)
+    {
+        Write-Host "Failed to locate attachment: $filePath" -ForegroundColor Red
+        exit
+    }
 }
 
 # Acquire token for application permissions
@@ -81,7 +83,7 @@ $createMessageJson = "{
     ""importance"":""Low"",
     ""body"":{
         ""contentType"":""HTML"",
-        ""content"":""Please check attachment and discard.""
+        ""content"":""Please check attachment(s) and discard.""
     },
     ""toRecipients"":[
         {
@@ -95,7 +97,7 @@ $createMessageJson = "{
 try
 {
     Write-Host "Sending request to: $createUrl" -ForegroundColor White
-    $global:createMessageResults = Invoke-RestMethod -Method Post -Uri $createUrl -Headers $authHeader -Body $createMessageJson -ContentType "application/json"
+    $createMessageResults = Invoke-RestMethod -Method Post -Uri $createUrl -Headers $authHeader -Body $createMessageJson -ContentType "application/json"
 }
 catch
 {
@@ -103,77 +105,99 @@ catch
     exit
 }
 
-if ([String]::IsNullOrEmpty(($global:createMessageResults.id)))
+if ([String]::IsNullOrEmpty(($createMessageResults.id)))
 {
     Write-Host "Failed to read message Id of created message." -ForegroundColor Red
     exit
 }
 
 
-# Create upload session
-$createUploadSessionUrl = "$($graphUrl)messages/$($global:createMessageResults.id)/attachments/createUploadSession"
-$createUploadSessionJson = "{
-    ""AttachmentItem"": {
-        ""attachmentType"": ""file"",
-        ""name"": ""$($attachmentFile.Name)"", 
-        ""size"": $($attachmentFile.Length)
-    }
-}"
+# Upload the attachments
 
-try
+foreach ($filePath in $FileAttachments)
 {
-    Write-Host "Sending request to: $createUploadSessionUrl" -ForegroundColor White
-    $global:createUploadSessionResults = Invoke-RestMethod -Method Post -Uri $createUploadSessionUrl -Headers $authHeader -Body $createUploadSessionJson -ContentType "application/json"
-}
-catch
-{
-    Write-Host "Failed to create upload session" -ForegroundColor Red
-    exit 
-}
+    Write-Host "Starting upload session for $filePath"
+    $attachmentFile = Get-Item $filePath
 
-if ([String]::IsNullOrEmpty(($global:createUploadSessionResults.uploadUrl)))
-{
-    Write-Host "Failed to create upload session." -ForegroundColor Red
-    exit
-}
+    # Create upload session
+    $createUploadSessionUrl = "$($graphUrl)messages/$($createMessageResults.id)/attachments/createUploadSession"
+    $createUploadSessionJson = "{
+        ""AttachmentItem"": {
+            ""attachmentType"": ""file"",
+            ""name"": ""$($attachmentFile.Name)"", 
+            ""size"": $($attachmentFile.Length)
+        }
+    }"
 
-$fileStream = New-Object -TypeName System.IO.FileStream -ArgumentList ($attachmentFile.VersionInfo.FileName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
-$fileReader = New-Object -TypeName System.IO.BinaryReader -ArgumentList $fileStream
-if (!$fileReader) { exit }
-
-
-$offset = 0
-$blockSize = 3Mb
-
-while ($offset -lt $attachmentFile.Length)
-{
-    # Read the next block of data from the file
-    $blockBytes = $fileReader.ReadBytes($blockSize)
-
-    # Prepare the request headers
-    $headers = @{
-        'Content-Length'=$blockBytes.Length;
-        'Content-Range'="bytes $offset-$($offset+$blockBytes.Length-1)/$($attachmentFile.Length)"
-    }
-    $offset += $blockBytes.Length
-
-    # Upload the data
     try
     {
-        Write-Host "Uploading to: $($global:createUploadSessionResults.uploadUrl)" -ForegroundColor White
-        $global:uploadResults = Invoke-WebRequest -Method Put -Uri $createUploadSessionResults.uploadUrl -Body $blockBytes -Headers $headers -ContentType "application/octet-stream" -UseBasicParsing
+        Write-Host "Sending request to: $createUploadSessionUrl" -ForegroundColor White
+        $createUploadSessionResults = Invoke-RestMethod -Method Post -Uri $createUploadSessionUrl -Headers $authHeader -Body $createUploadSessionJson -ContentType "application/json"
     }
     catch
     {
-        Write-Host "Failed to upload file" -ForegroundColor Red
-        $fileReader.Dispose()
-        $fileStream.Dispose()
+        Write-Host "Failed to create upload session" -ForegroundColor Red
         exit 
     }
+
+    if ([String]::IsNullOrEmpty(($createUploadSessionResults.uploadUrl)))
+    {
+        Write-Host "Failed to create upload session." -ForegroundColor Red
+        exit
+    }
+
+    # Upload the attachment (in blocks)
+    $fileStream = New-Object -TypeName System.IO.FileStream -ArgumentList ($attachmentFile.VersionInfo.FileName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+    $fileReader = New-Object -TypeName System.IO.BinaryReader -ArgumentList $fileStream
+    if (!$fileReader) { exit }
+
+
+    $offset = 0
+    $blockSize = 3Mb
+
+    while ($offset -lt $attachmentFile.Length)
+    {
+        # Read the next block of data from the file
+        $blockBytes = $fileReader.ReadBytes($blockSize)
+
+        # Prepare the request headers
+        $headers = @{
+            #'Content-Length'=$blockBytes.Length;
+            'Content-Range'="bytes $offset-$($offset+$blockBytes.Length-1)/$($attachmentFile.Length)"
+        }
+        if  ($PSVersionTable.PSVersion.Major -lt 7)
+        {
+            $headers.Add("Content-Length",$blockBytes.Length)
+        }
+        $offset += $blockBytes.Length
+
+        # Upload the data
+        try
+        {
+            Write-Host "Uploading to: $($createUploadSessionResults.uploadUrl)" -ForegroundColor White
+            if ($PSVersionTable.PSVersion.Major -lt 7)
+            {
+                $global:uploadResults = Invoke-WebRequest -Method Put -Uri $createUploadSessionResults.uploadUrl -Body $blockBytes -Headers $headers -ContentType "application/octet-stream"
+            }
+            else
+            {
+                $global:uploadResults = Invoke-WebRequest -Method Put -Uri $createUploadSessionResults.uploadUrl -Body $blockBytes -Headers $headers -ContentType "application/octet-stream" -SkipHeaderValidation
+            }
+        }
+        catch
+        {
+            Write-Host "Failed to upload file: $filePath" -ForegroundColor Red
+            $fileReader.Dispose()
+            $fileStream.Dispose()
+            exit 
+        }
+    }
+    Write-Host "Finished uploading: $filePath"
+
+
+    $fileReader.Dispose()
+    $fileStream.Dispose()
 }
 
-
-$fileReader.Dispose()
-$fileStream.Dispose()
 
 Write-Host "Message creation and attachment upload succeeded." -ForegroundColor Green
