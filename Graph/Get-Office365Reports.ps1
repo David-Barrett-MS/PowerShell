@@ -130,7 +130,7 @@ foreach ($report in $RequestedReports)
                 catch
                 {
                     # We check for throttling - if we are throttled, we simply sleep for a while and try again
-                    if ($Error[0].ErrorDetails.Message.ToString().Contains("Please retry later"))
+                    if ($Error[0].ToString().Contains("Please retry later") -or $Error[0].ToString().Contains("429"))
                     {
                         Write-Host "Throttled. Waiting for thirty seconds before continuing." -ForegroundColor Yellow
                         Start-Sleep -Seconds 30
