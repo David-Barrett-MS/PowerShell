@@ -11,17 +11,12 @@
     [ValidateNotNullOrEmpty()]
     [string]$TenantDomain,
 
-    [Parameter(Mandatory=$False,HelpMessage="Name of the report to retrieve")]
+    [Parameter(Mandatory=$True,HelpMessage="Name of the report to retrieve")]
     [ValidateNotNullOrEmpty()]
-    [string]$ReportName = "getEmailActivityCounts",
+    [string]$UserId = "",
 
-    [Parameter(Mandatory=$False,HelpMessage="Period of the report to retrieve")]
-    [ValidateNotNullOrEmpty()]
-    [string]$Period = "D7",
-    
-    [Parameter(Mandatory=$False,HelpMessage="Path to save the report")]
-    [ValidateNotNullOrEmpty()]
-    [string]$SavePath = ""
+    [Parameter(Mandatory=$False,HelpMessage="If specified, channels will be retrieved as well as chats")]
+    [switch]$Channels
 )
 
 
@@ -34,20 +29,25 @@ $Body = @{
 } 
 $authResponse = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$TenantDomain/oauth2/v2.0/token" -Method POST -Body $Body -ErrorAction STOP
 
-# Get report
+# Get all messages
 $Headers = @{
     'Authorization' = "Bearer $($authResponse.access_token)"
 }
-$report = Invoke-RestMethod -Headers $Headers -Uri "https://graph.microsoft.com/v1.0/reports/$($ReportName)(period='$Period')" -Method Get
+$chatMessages = Invoke-RestMethod -Headers $Headers -Uri "https://graph.microsoft.com/v1.0/users/$UserId/chats/getAllMessages" -Method Get
 
-# Output report
+# Output data
 if (![String]::IsNullOrEmpty($SavePath))
 {
     $currentDate = get-date -Format d
     $currentDate = $currentDate.Replace('/','-')
-    $report | out-file -FilePath "$SavePath\$ReportName$currentDate.csv"
+    $chatMessages | out-file -FilePath "$SavePath\Chats-$UserId-$currentDate.csv"
 }
 else
 {
     $report
+}
+
+if ($Channels)
+{
+    $channelMessages = Invoke-RestMethod -Headers $Headers -Uri "https://graph.microsoft.com/v1.0/users/$UserId/chats/getAllMessages" -Method Get
 }

@@ -17,7 +17,7 @@
 Create a Draft message and add one or multiple large attachments.
 
 .DESCRIPTION
-This script demonstrates how to create a draft message and add a large attachment using createUploadSession.
+This script demonstrates how to create a draft message and add large attachments using createUploadSession.
 https://docs.microsoft.com/en-us/graph/api/attachment-createuploadsession
 
 .EXAMPLE
@@ -46,7 +46,7 @@ param (
 	[ValidateNotNullOrEmpty()]
     $FileAttachments
 )
-$script:ScriptVersion = "1.0.1"
+$script:ScriptVersion = "1.0.2"
 
 $graphUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/"
 
@@ -162,11 +162,11 @@ foreach ($filePath in $FileAttachments)
 
         # Prepare the request headers
         $headers = @{
-            #'Content-Length'=$blockBytes.Length;
             'Content-Range'="bytes $offset-$($offset+$blockBytes.Length-1)/$($attachmentFile.Length)"
         }
         if  ($PSVersionTable.PSVersion.Major -lt 7)
         {
+            # PowerShell 7 adds Content-Length header itself, but we need to specify it for earlier versions
             $headers.Add("Content-Length",$blockBytes.Length)
         }
         $offset += $blockBytes.Length
@@ -175,6 +175,7 @@ foreach ($filePath in $FileAttachments)
         try
         {
             Write-Host "Uploading to: $($createUploadSessionResults.uploadUrl)" -ForegroundColor White
+            # We're not interested in the uploadResults here, but we assign it to a global variable for easier troubleshooting
             if ($PSVersionTable.PSVersion.Major -lt 7)
             {
                 $global:uploadResults = Invoke-WebRequest -Method Put -Uri $createUploadSessionResults.uploadUrl -Body $blockBytes -Headers $headers -ContentType "application/octet-stream"
