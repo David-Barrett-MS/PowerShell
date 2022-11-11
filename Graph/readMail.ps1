@@ -23,6 +23,9 @@ https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1
 An application must be registered with the Microsoft Graph Mail.Read permission assigned.  This script uses Application permissions
 and a secret key - pass the relevant information via parameters.
 
+After retrieving the messages (by running this script), you can access the response using $messages.  If no SavePath is specified,
+the subject of each retrieved message will be output to host.
+
 .EXAMPLE
 .\readMail.ps1 -AppId "<AppId>" -TenantId "<TenantId>" -AppSecretKey "<AppSecretKey>" -Mailbox "<mailbox>"
 
@@ -30,24 +33,28 @@ and a secret key - pass the relevant information via parameters.
 
 
 param (
-	[Parameter(Mandatory=$False,HelpMessage="Application Id (obtained when registering the application in Azure AD")]
-	[ValidateNotNullOrEmpty()]
-	[string]$AppId,
+    [Parameter(Mandatory=$False,HelpMessage="Application Id (obtained when registering the application in Azure AD")]
+    [ValidateNotNullOrEmpty()]
+    [string]$AppId,
 
-	[Parameter(Mandatory=$False,HelpMessage="Application secret key (obtained when registering the application in Azure AD")]
-	[ValidateNotNullOrEmpty()]
-	[string]$AppSecretKey,
+    [Parameter(Mandatory=$False,HelpMessage="Application secret key (obtained when registering the application in Azure AD")]
+    [ValidateNotNullOrEmpty()]
+    [string]$AppSecretKey,
 
-	[Parameter(Mandatory=$False,HelpMessage="Tenant Id")]
-	[ValidateNotNullOrEmpty()]
-	[string]$TenantId,
+    [Parameter(Mandatory=$False,HelpMessage="Tenant Id")]
+    [ValidateNotNullOrEmpty()]
+    [string]$TenantId,
 
-	[Parameter(Mandatory=$False,HelpMessage="Mailbox")]
-	[ValidateNotNullOrEmpty()]
-	[string]$Mailbox,
+    [Parameter(Mandatory=$False,HelpMessage="Mailbox")]
+    [ValidateNotNullOrEmpty()]
+    [string]$Mailbox,
 
-	[Parameter(Mandatory=$False,HelpMessage="Determines how many messages will be retrieved.")]
-	$Top = 10
+    [Parameter(Mandatory=$False,HelpMessage="Save path (messages response will be saved here)")]
+    [ValidateNotNullOrEmpty()]
+    [string]$SavePath,
+
+    [Parameter(Mandatory=$False,HelpMessage="Determines how many messages will be retrieved.")]
+    $Top = 10
 )
 
 
@@ -75,9 +82,9 @@ if (![String]::IsNullOrEmpty($SavePath))
 {
     $currentDate = get-date -Format d
     $currentDate = $currentDate.Replace('/','-')
-    $messages | out-file -FilePath "$SavePath\Messages-$UserId-$currentDate.json"
+    ConvertTo-Json $messages.value | out-file -FilePath "$SavePath\Messages-$UserId-$currentDate.json"
 }
 else
 {
-    $messages.value
+    $messages.value.subject
 }
