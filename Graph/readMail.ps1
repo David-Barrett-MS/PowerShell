@@ -51,7 +51,7 @@ param (
 )
 
 
-$graphUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/messages"
+$graphUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/messages?top=$Top"
 
 # Acquire token for application permissions
 $body = @{grant_type="client_credentials";scope="https://graph.microsoft.com/.default";client_id=$AppId;client_secret=$AppSecretKey}
