@@ -33,19 +33,19 @@ the subject of each retrieved message will be output to host.
 
 
 param (
-    [Parameter(Mandatory=$False,HelpMessage="Application Id (obtained when registering the application in Azure AD")]
+    [Parameter(Mandatory=$True,HelpMessage="Application Id (obtained when registering the application in Azure AD")]
     [ValidateNotNullOrEmpty()]
     [string]$AppId,
 
-    [Parameter(Mandatory=$False,HelpMessage="Application secret key (obtained when registering the application in Azure AD")]
+    [Parameter(Mandatory=$True,HelpMessage="Application secret key (obtained when registering the application in Azure AD")]
     [ValidateNotNullOrEmpty()]
     [string]$AppSecretKey,
 
-    [Parameter(Mandatory=$False,HelpMessage="Tenant Id")]
+    [Parameter(Mandatory=$True,HelpMessage="Tenant Id")]
     [ValidateNotNullOrEmpty()]
     [string]$TenantId,
 
-    [Parameter(Mandatory=$False,HelpMessage="Mailbox")]
+    [Parameter(Mandatory=$True,HelpMessage="Mailbox")]
     [ValidateNotNullOrEmpty()]
     [string]$Mailbox,
 
