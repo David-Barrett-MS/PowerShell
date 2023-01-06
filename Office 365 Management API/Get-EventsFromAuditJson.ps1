@@ -17,6 +17,7 @@ dir "$SourceFolder\*.txt" | foreach {
 if ($global:events.Count -lt 1)
 {
     Write-Host "Failed to read any events" -ForegroundColor Red
+    exit
 }
 
 Write-Host "$($global:events.Count) events loaded" -ForegroundColor Green
