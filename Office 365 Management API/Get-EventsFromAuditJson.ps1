@@ -1,7 +1,12 @@
-$sourceFolder = "C:\Temp\Management API\PowerBi Test"
+param (
+	[Parameter(Mandatory=$True,HelpMessage="Path from which to read event logs")]
+	[ValidateNotNullOrEmpty()]
+	[string]$SourceFolder
+)
+
 $global:events = @()
 
-dir "$sourceFolder\*.txt" | foreach {
+dir "$SourceFolder\*.txt" | foreach {
     $fileContent = Get-Content $_
     $fileEvents = ConvertFrom-Json $fileContent
     foreach ($fileEvent in $fileEvents) {
@@ -9,7 +14,18 @@ dir "$sourceFolder\*.txt" | foreach {
         $global:events += $fileEvent
     }
 }
+if ($global:events.Count -lt 1)
+{
+    Write-Host "Failed to read any events" -ForegroundColor Red
+}
 
+Write-Host "$($global:events.Count) events loaded" -ForegroundColor Green
+
+Write-Host "Example event query:"
+Write-Host "`$events | where-object -FilterScript { `$_.recordtype -eq 84 -or `$_.recordtype -eq 83 } | ft" -ForegroundColor Yellow
+Write-Host
+Write-Host "Example export of events:"
+Write-Host "`$events | where-object -FilterScript { `$_.recordtype -eq 84 -or `$_.recordtype -eq 83 } | export-csv `"o365api.csv`" -NoTypeInformation" -ForegroundColor Yellow
 
 <#
 $events | where-object -FilterScript { $_.recordtype -eq 84 -or $_.recordtype -eq 83 -or $_.recordtype -eq 43} | ft
