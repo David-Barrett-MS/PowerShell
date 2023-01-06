@@ -54,9 +54,9 @@ param (
 	[ValidateNotNullOrEmpty()]
 	[string]$ReportSavePath,
 
-	[Parameter(Mandatory=$False,HelpMessage="The report (or list of reports) to retrieve.  Defaults to getOffice365ActiveUserDetail, getOffice365ActiveUserCounts, getEmailActivityUserDetail, getOneDriveActivityUserDetail.")]
+	[Parameter(Mandatory=$False,HelpMessage="The report (or list of reports) to retrieve.  Defaults to getOffice365ActiveUserDetail, getOffice365ActiveUserCounts, getEmailActivityUserDetail, getEmailAppUsageUserDetail.")]
     [ValidateNotNullOrEmpty()]
-	$RequestedReports = @( "getMailboxUsageDetail", "getOffice365ActiveUserDetail", "getOffice365ActiveUserCounts", "getEmailActivityUserDetail", "getOneDriveActivityUserDetail"),
+	$RequestedReports = @( "getMailboxUsageDetail", "getOffice365ActiveUserDetail", "getOffice365ActiveUserCounts", "getEmailActivityUserDetail", "getEmailAppUsageUserDetail"),
 
 	[Parameter(Mandatory=$False,HelpMessage="The report period(s) to retrieve.  Defaults to all (D7, D30, D90, D180).")]
     [ValidateNotNullOrEmpty()]
@@ -129,11 +129,11 @@ foreach ($report in $RequestedReports)
                 }
                 catch
                 {
-                    # We check for throttling - if we are throttled, we simply sleep for a while and try again
-                    if ($Error[0].ToString().Contains("Please retry later") -or $Error[0].ToString().Contains("429"))
+                    # We check for throttling - if we are throttled, we simply sleep for a while and try again.
+                    if ($Error[0].ToString().Contains("Please retry later") -or $Error[0].ToString().Contains(" 429"))
                     {
-                        Write-Host "Throttled. Waiting for thirty seconds before continuing." -ForegroundColor Yellow
-                        Start-Sleep -Seconds 30
+                        Write-Host "Throttled. Waiting for forty seconds before continuing." -ForegroundColor Yellow
+                        Start-Sleep -Seconds 40
                         $results = $null
                     }
                 }
