@@ -32,47 +32,47 @@ Retrieves the message trace report for the specified period and assigns the resu
 #>
 
 param (
-	[Parameter(Mandatory=$True,HelpMessage="Application Id (obtained when registering the application in Azure AD.")]
-	[ValidateNotNullOrEmpty()]
-	[string]$AppId,
+    [Parameter(Mandatory=$True,HelpMessage="Application Id (obtained when registering the application in Azure AD.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$AppId,
 
-	[Parameter(Mandatory=$True,HelpMessage="Application secret key (obtained when registering the application in Azure AD.")]
-	[ValidateNotNullOrEmpty()]
-	[string]$AppSecretKey,
+    [Parameter(Mandatory=$True,HelpMessage="Application secret key (obtained when registering the application in Azure AD.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$AppSecretKey,
 
     [Parameter(Mandatory=$False,HelpMessage="Required when using application permissions.  Please note that certificate auth requires the MSAL dll to be available.")]
     $OAuthCertificate = $null,
     
-	[Parameter(Mandatory=$True,HelpMessage="Tenant Id.")]
-	[ValidateNotNullOrEmpty()]
-	[string]$TenantId,
+    [Parameter(Mandatory=$True,HelpMessage="Tenant Id.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$TenantId,
 
     [Parameter(Mandatory=$False,HelpMessage="The redirect Uri of the Azure registered application.")]
     [string]$RedirectUrl = "http://localhost/code",
 
-	[Parameter(Mandatory=$False,HelpMessage="Report save path (reports are prepended by the StartDate-EndDate or current date if no date parameters specified).  If missing, current folder is used.")]
-	[ValidateNotNullOrEmpty()]
-	[string]$ReportSavePath,
-
-	[Parameter(Mandatory=$False,HelpMessage="When specified, the message trace report will be output to the pipeline.")]
-	[ValidateNotNullOrEmpty()]
-	[switch]$OutHost,
-
-	#[Parameter(Mandatory=$False,HelpMessage="The Internet MessageID header of the message.")]
-	#[ValidateNotNullOrEmpty()]
-	#[string]$MessageId,
-
-	#[Parameter(Mandatory=$False,HelpMessage="An identifier used to get the detailed message transfer trace information.")]
-	#[ValidateNotNullOrEmpty()]
-	#[string]$MessageTraceId,
-
-	[Parameter(Mandatory=$False,HelpMessage="This field is used to limit the report period.")]
+    [Parameter(Mandatory=$False,HelpMessage="Report save path (reports are prepended by the StartDate-EndDate or current date if no date parameters specified).  If missing, current folder is used.")]
     [ValidateNotNullOrEmpty()]
-	[DateTime]$StartDate = [DateTime]::MinValue,
+    [string]$ReportSavePath,
 
-	[Parameter(Mandatory=$False,HelpMessage="This field is used to limit the report period.")]
+    [Parameter(Mandatory=$False,HelpMessage="When specified, the message trace report will be output to the pipeline.")]
     [ValidateNotNullOrEmpty()]
-	[DateTime]$EndDate = [DateTime]::MinValue
+    [switch]$OutHost,
+
+    #[Parameter(Mandatory=$False,HelpMessage="The Internet MessageID header of the message.")]
+    #[ValidateNotNullOrEmpty()]
+    #[string]$MessageId,
+
+    #[Parameter(Mandatory=$False,HelpMessage="An identifier used to get the detailed message transfer trace information.")]
+    #[ValidateNotNullOrEmpty()]
+    #[string]$MessageTraceId,
+
+    [Parameter(Mandatory=$False,HelpMessage="This field is used to limit the report period.")]
+    [ValidateNotNullOrEmpty()]
+    [DateTime]$StartDate = [DateTime]::MinValue,
+
+    [Parameter(Mandatory=$False,HelpMessage="This field is used to limit the report period.")]
+    [ValidateNotNullOrEmpty()]
+    [DateTime]$EndDate = [DateTime]::MinValue
 
 )
 $script:ScriptVersion = "0.1.0"
@@ -223,7 +223,7 @@ if (![String]::IsNullOrEmpty($ReportSavePath) -and !$ReportSavePath.EndsWith("\"
     $ReportSavePath = "$ReportSavePath\"
 }
 
-# https://reports.office365.com/ecp/reportingwebservice/reporting.svc/MessageTrace[?ODATA options]
+# Base Uri: https://reports.office365.com/ecp/reportingwebservice/reporting.svc/MessageTrace[?ODATA options]
 $reportUri = "https://reports.office365.com/ecp/reportingwebservice/reporting.svc/MessageTrace?"
 $outputFile = "$ReportSavePath$([DateTime]::Today.ToString("yyyyMMdd"))MessageTrace.xml"
 if ($StartDate -gt [DateTime]::MinValue -or $EndDate -gt [DateTime]::MinValue)
