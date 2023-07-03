@@ -121,7 +121,7 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="HTTP trace file - all HTTP request and responses will be logged to this file")]	
     [string]$DebugPath = ""
 )
-$script:ScriptVersion = "1.1.6"
+$script:ScriptVersion = "1.1.7"
 
 # We work out the root Uri for our requests based on the tenant Id
 $rootUri = "https://manage.office.com/api/v1.0/$tenantId/activity/feed"
@@ -413,7 +413,7 @@ function RetriableInvoke-WebRequest
             }
         }
         catch {
-            Write-Host "Failed" Red
+            ReportError "Invoke-WebRequest"
             exit
         }
         $retries++
@@ -575,13 +575,14 @@ Function CreatePermissionSet([string] $ResourceDisplayName, [string[]]$Permissio
 Function RegisterAzureApplication
 {
     # Check we have Azure AD module available
-    $azureAD = Get-Module -Name "AzureAD"
+    $azureAD = Get-Module AzureAD -ListAvailable
     if (!$azureAD)
     {
-        LogVerbose "AzureAD module not available, attempting to install"
+        Log "AzureAD module not available, attempting to install" Yellow
         try
         {
             Install-Module "AzureAD"
+            $azureAD = Get-Module AzureAD -ListAvailable
         }
         catch
         {
@@ -589,6 +590,7 @@ Function RegisterAzureApplication
             Exit
         }
     }
+    Import-Module $azureAD
 
     LogVerbose "Attempting to register application in Azure"
 
@@ -644,7 +646,7 @@ Function RegisterAzureApplication
     }
     
     $appRegKey = CreateAppKey -ValidFromDate $([DateTime]::Now) -DurationInYears 2 -SecretKey $AppSecretKey
-    $azureApplication = New-AzureADApplication -DisplayName "$AzureApplicationName" -HomePage "https://localhost/$AzureApplicationName" -IdentifierUris "https://$tenantName/$AzureApplicationName" -PasswordCredentials $appRegKey -PublicClient $False -ReplyUrls @("$AppRedirectURI")
+    $azureApplication = New-AzureADApplication -DisplayName "$AzureApplicationName" -HomePage "http://localhost/$AzureApplicationName" -IdentifierUris "https://$tenantName/$AzureApplicationName" -PasswordCredentials $appRegKey -PublicClient $False -ReplyUrls @("$AppRedirectURI")
     if (!$azureApplication)
     {
         Log "Failed to create Azure application" Red
@@ -724,7 +726,15 @@ function SubscribeContentType([string]$SubscriptionContentType)
     }
     [string]$json = ConvertTo-JSON -InputObject $request
     LogVerbose $("Webhook details: " + $json.Replace("`r`n", ""))
-    PostRest "$rootUri/subscriptions/start?contentType=$SubscriptionContentType&PublisherIdentifier=$PublisherId" $json
+    $result = PostRest "$rootUri/subscriptions/start?contentType=$SubscriptionContentType&PublisherIdentifier=$PublisherId" $json
+    if ($result -and $result.StatusCode -eq 200)
+    {
+        Log "Content-Type $SubscriptionContentType subscription started" Green
+    }
+    else
+    {
+        Log "FAILED to start Content-Type $SubscriptionContentType" Red
+    }
 }
 
 if ($Start)
@@ -739,7 +749,7 @@ if ($Start)
         # No Content Type specified, so subscribe to all that we know about
         foreach ($ct in $AvailableContentTypes)
         {
-            LogVerbose "Enabling Content-Type $ct"
+            Log "Starting Content-Type $ct" Gray
             SubscribeContentType $ct
         }
     }
@@ -753,9 +763,35 @@ if ($Start)
 #
 ########################################################
 
+function UnsubscribeContentType([string]$SubscriptionContentType)
+{
+    Log "Stopping Content-Type $SubscriptionContentType" Gray
+    $result = PostRest "$rootUri/subscriptions/stop?contentType=$SubscriptionContentType&PublisherIdentifier=$PublisherId" ""
+    if ($result -and $result.StatusCode -eq 204)
+    {
+        Log "Content-Type $SubscriptionContentType subscription stopped" Green
+    }
+    else
+    {
+        Log "FAILED to stop Content-Type $SubscriptionContentType" Red
+    }
+}
+
 if ($Stop)
 {
-    PostRest "$rootUri/subscriptions/stop?contentType=$ContentType&PublisherIdentifier=$PublisherId" ""
+    if (![String]::IsNullOrEmpty($ContentType))
+    {
+        # We have a specified Content Type to subscribe to
+        UnsubscribeContentType $ContentType
+    }
+    else
+    {
+        # No Content Type specified, so subscribe to all that we know about
+        foreach ($ct in $AvailableContentTypes)
+        {
+            UnsubscribeContentType $ct
+        }
+    }
     Exit
 }
 
