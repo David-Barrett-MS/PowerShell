@@ -121,7 +121,7 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="HTTP trace file - all HTTP request and responses will be logged to this file")]	
     [string]$DebugPath = ""
 )
-$script:ScriptVersion = "1.1.7"
+$script:ScriptVersion = "1.1.8"
 
 # We work out the root Uri for our requests based on the tenant Id
 $rootUri = "https://manage.office.com/api/v1.0/$tenantId/activity/feed"
@@ -156,6 +156,18 @@ Function LogVerbose([string]$Details)
 {
     Write-Verbose $Details
     LogToFile $Details
+}
+
+function LogDownloadJob([string]$DownloadJobResults)
+{
+    $lines = $DownloadJobResults -split "`r`n"
+    foreach ($line in $lines)
+    {
+        if (![String]::IsNullOrEmpty($line))
+        {
+            LogToFile $line
+        }        
+    }
 }
 
 Function LogDebug([string]$Details)
@@ -214,7 +226,7 @@ function LoadLibraries
 
         if ($searchProgramFiles)
         {
-            if ($dll -eq $null)
+            if ($null -eq $dll)
             {
 	            $dll = Get-ChildItem -Recurse "C:\Program Files (x86)" -ErrorAction SilentlyContinue | Where-Object { ($_.PSIsContainer -eq $false) -and ( $_.Name -eq $dllName ) }
 	            if (!$dll)
@@ -224,7 +236,7 @@ function LoadLibraries
             }
         }
 
-        if ($dll -eq $null)
+        if ($null -eq $dll)
         {
             Log "Unable to load locate $dll" Red
             return $false
@@ -328,7 +340,7 @@ function GetAccessToken
 function GetValidAccessToken
 {
     # Check if access token needs renewing, and if so renew it.  We renew only if token has expired (before this, ADAL will simply return the same one)
-    if ($script:oauthToken -ne $null)
+    if ($null -ne $script:oauthToken)
     {
         # We already have a token
         if ($script:oauthTokenAcquireTime.AddSeconds($script:oauthToken.expires_in) -gt [DateTime]::UtcNow.AddMinutes(1))
@@ -353,7 +365,7 @@ function GetValidAccessToken
     return $script:oAuthAccessToken
 }
 
-function RetriableInvoke-WebRequest
+function RetriableInvokeWebRequest
 {
     param (
         [parameter(Mandatory=$true)][string]$Uri,
@@ -369,7 +381,7 @@ function RetriableInvoke-WebRequest
     $result = $null
 
     # Ensure we have a valid access token
-    if ($Headers -ne $null)
+    if ($null -ne $Headers)
     {
         if ($Headers.ContainsKey("Authorization"))
         {
@@ -417,7 +429,7 @@ function RetriableInvoke-WebRequest
             exit
         }
         $retries++
-    } until ( ($result -ne $null) -or ($retries -gt 3) )
+    } until ( ($null -ne $result) -or ($retries -gt 3) )
 
     return $result
 
@@ -433,7 +445,7 @@ Function GetWithTrace()
 
     if ( [String]::IsNullOrEmpty($DebugPath) )
     {
-        return $(RetriableInvoke-WebRequest -Uri $requestUrl -Headers $headers -Method Get)
+        return $(RetriableInvokeWebRequest -Uri $requestUrl -Headers $headers -Method Get)
     }
 
     $traceFilename = $DebugPath
@@ -444,7 +456,7 @@ Function GetWithTrace()
 
     "GET $requestUrl" |  Out-File "$traceFilename.request"
     $headers | Format-Table -HideTableHeaders -Wrap | Out-File "$traceFilename.request" -Append
-    $data = RetriableInvoke-WebRequest -Uri $requestUrl -Headers $headers -Method Get
+    $data = RetriableInvokeWebRequest -Uri $requestUrl -Headers $headers -Method Get
     if ($data.RawContent)
     {
         $data.RawContent | Out-File "$traceFilename.response"
@@ -464,7 +476,7 @@ Function PostRest
         [parameter(Position=1,Mandatory=$true)]$request
     )
 
-    return RetriableInvoke-WebRequest -Uri $requestUrl -ContentType "application/json" -Method Post -Body $request
+    return RetriableInvokeWebRequest -Uri $requestUrl -ContentType "application/json" -Method Post -Body $request
 }
 
 # GET a REST response
@@ -477,7 +489,7 @@ Function GetRest
     $script:nextPageUri = ""
     LogVerbose "REST query: $requestUrl"
     $thisPage = GetWithTrace -requestUrl $requestUrl
-    if ($thisPage.Headers.NextPageUri -ne $null)
+    if ($null -ne $thisPage.Headers.NextPageUri)
     {
         $script:nextPageUri = $thisPage.Headers.NextPageUri
         LogVerbose "NextPageUri: $($script:nextPageUri)"
@@ -608,18 +620,18 @@ Function RegisterAzureApplication
         {
             $tenant = Get-AzureADTenantDetail
         } catch {}
-        if ($tenant -eq $null)
+        if ($null -eq $tenant)
         {
             Connect-AzureAD | out-null
         }
     }
-    if ($tenant -eq $null)
+    if ($null -eq $tenant)
     {
         try
         {
             $tenant = Get-AzureADTenantDetail
         } catch {}
-        if ($tenant -eq $null)
+        if ($null -eq $tenant)
         {
             Log "Failed to connect to Azure tenant" Red
             return
@@ -627,7 +639,7 @@ Function RegisterAzureApplication
     }
     
     # If we get here, then we have successfully logged onto a tenant
-    $tenantName =  ($tenant.VerifiedDomains | Where { $_._Default -eq $True }).Name
+    $tenantName =  ($tenant.VerifiedDomains | Where-Object { $_._Default -eq $True }).Name
     LogVerbose "Will register application in tenant: $tenantName"
     if ([String]::IsNullOrEmpty($TenantId))
     {
@@ -879,10 +891,31 @@ function ListContent($listContentType)
         # Retrieve the content links
         while ( ![String]::IsNullOrEmpty($script:nextPageUri) )
         {
-            $sanityCheck = $script:nextPageUri
-            $content = GetRest $script:nextPageUri
+            $thisPageUri = $script:nextPageUri
+            $content = GetRest $script:nextPageUri # This will set nextPageUri to the next page (or null)
+
+            if ($null -eq $content)
+            {
+                # Pause one second then try again
+                $retries = 3
+                $delay = 1
+                while ($null -eq $content -and $retries -gt 0)
+                {
+                    LogVerbose "Failed to retrieve content - retrying in $delay seconds"
+                    Start-Sleep -Seconds $delay
+                    $content = GetRest $thisPageUri
+                    $retries--
+                    $delay *= 2
+                }
+                if ($null -eq $content)
+                {
+                    Log "Failed to retrieve content from $thisPageUri" Red
+                    $script:nextPageUri = $null
+                    break
+                }
+            }
                 
-            if ($content -ne $null)
+            if ($null -ne $content)
             {
                 if (!$RetrieveContent)
                 {
@@ -908,14 +941,12 @@ function ListContent($listContentType)
                     }
                 }
                 $content = $null
-            }
-            else
-            {
-                # Failed to retrieve any content
-                if ($sanityCheck -eq $script:nextPageUri)
+                if ($thisPageUri -eq $script:nextPageUri)
                 {
                     $script:nextPageUri = $null
-                    Log "Unexpected failure in nextPageUri processing" Red
+                    Log "Unexpected failure in nextPageUri processing - last nextPageUri is the same as this one:" Red
+                    Log "Last nextPageUri: $thisPageUri"
+                    Log "This nextPageUri: $($script:nextPageUri)"
                 }
             }
         }
@@ -951,6 +982,7 @@ $downloadFunction = {
         $auditData = ""
         $auditResponse = Invoke-WebRequest -Uri $contentUrl -Headers @{"Authorization" = $auth} -Method Get
         $auditData = $auditResponse.Content
+        $downloadLog = New-Object System.Text.StringBuilder
 
         if ($auditData.Length -gt 0)
         {
@@ -975,6 +1007,7 @@ $downloadFunction = {
                     {
                         # This data is different - which is unexpected, so we'll save it as an additional file
                         Write-Host "Content blob is different to the one already retrieved, but should be the same: $outputFile.txt" -ForegroundColor Red
+                        $downloadLog.AppendLine("Content blob is different to the one already retrieved, but should be the same: $outputFile.txt") | out-null
                         $i = 1
                         while ($(Test-Path "$outputFile.$i.txt"))
                             { $i++ }
@@ -983,12 +1016,14 @@ $downloadFunction = {
                     else
                     {
                         Write-Host "Data already retrieved: $outputFile.txt"
+                        $downloadLog.AppendLine("Data already retrieved: $outputFile.txt") | out-null
                         $outputFile = ""
                     }
                 }
                 if (![String]::IsNullOrEmpty($outputFile))
                 {
                     Write-Host "Saving data blob to: $outputFile.txt"
+                    $downloadLog.AppendLine("Saving data blob to: $outputFile.txt") | out-null
                     $auditData | Out-File -Filepath "$outputFile.txt" -NoClobber
                 }
             }
@@ -996,7 +1031,9 @@ $downloadFunction = {
         else
         {
             Write-Host "No data returned from $contentUrl" -ForegroundColor Red
+            $downloadLog.AppendLine("No data returned from $contentUrl") | out-null
         }
+        return $downloadLog.ToString()
     }
 }
 
@@ -1031,8 +1068,12 @@ if ($RetrieveContent -and $contentUrls.Length -gt 0)
             {
                 if ($activeJobs[$i].State -ne "Running")
                 {
-                    Receive-Job $activeJobs[$i]
-                    LogVerbose "Final job state: $($activeJobs[$i].State)"
+                    $jobResults = Receive-Job -Job $activeJobs[$i]
+                    LogDownloadJob $jobResults
+                    if ($activeJobs[$i].State -ne "Completed")
+                    {
+                        LogVerbose "Final job state: $($activeJobs[$i].State)"
+                    }                    
                     $activeJobs.RemoveAt($i)
                 }
             }
@@ -1055,7 +1096,9 @@ if ($RetrieveContent -and $contentUrls.Length -gt 0)
             Write-Verbose "Waiting for job $i to finish"
             $activeJobs[$i] | Wait-Job | out-null
         }
-        Receive-Job $activeJobs[$i]
+        $jobResults = Receive-Job -Job $activeJobs[$i]
+        LogDownloadJob $jobResults
+        #$activeJobs[$i] | Receive-Job
         if ($activeJobs[$i].State -ne "Completed")
         {
             Log "Final job state ($i): $($activeJobs[$i].State)" Yellow
