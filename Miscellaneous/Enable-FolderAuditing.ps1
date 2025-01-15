@@ -27,7 +27,6 @@ param (
 if ($EnableLocalPolicy) {
     # Check audit settings
     AuditPol.exe /set /subcategory:"File System" /success:enable /failure:enable | Tee-Object -Variable setAuditResult
-    $global:test = $setAuditResult
     if (!($setAuditResult.StartsWith("The command was successfully executed"))) {
         Write-Host "Failed to update audit settings.  Is this an administrator PowerShell session?" -ForegroundColor Red
     }
