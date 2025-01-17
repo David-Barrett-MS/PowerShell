@@ -92,6 +92,9 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="If this is specified, content will be saved to this path (each content blob will be a separate text file)")]
     [string]$SaveContentPath,
 
+    [Parameter(Mandatory=$False,HelpMessage="If this is specified, the list of content URLs will be output to this file")]
+    [string]$ExportBlobUrls,
+
     [Parameter(Mandatory=$False,HelpMessage="Maximum number of jobs that can run at one time (in parallel) to download content.")]
     [int]$MaxRetrieveContentJobs = 32,
 
@@ -121,7 +124,7 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="HTTP trace file - all HTTP request and responses will be logged to this file")]	
     [string]$DebugPath = ""
 )
-$script:ScriptVersion = "1.1.8"
+$script:ScriptVersion = "1.1.9"
 
 # We work out the root Uri for our requests based on the tenant Id
 $rootUri = "https://manage.office.com/api/v1.0/$tenantId/activity/feed"
@@ -418,21 +421,22 @@ function RetriableInvokeWebRequest
             }
         }
         catch [System.Net.WebException] {
-            ReportError "Invoke-WebRequest"
-            if ($error[0].Exception.ToString().Contains("(400) Bad Request"))
+            $StatusCode = $_.Exception.Response.StatusCode.value__
+            ReportError "Invoke-WebRequest ($StatusCode)"
+            if ($StatusCode -eq 400)
             {
-                $result = $error[0].ErrorDetails.Message
+                Log "Bad request: $($_.ErrorDetails.Message)" Red
+                return $result
             }
         }
         catch {
-            ReportError "Invoke-WebRequest"
-            exit
+            $StatusCode = $_.Exception.Response.StatusCode.value__
+            ReportError "Invoke-WebRequest ($StatusCode)"
         }
         $retries++
     } until ( ($null -ne $result) -or ($retries -gt 3) )
 
     return $result
-
 }
 
 $script:requestIndex = 1 # We trace by dumping each request and response to a new file
@@ -486,16 +490,19 @@ Function GetRest
         [parameter(Position=0,Mandatory=$true)][string]$requestUrl
     )
 
-    $script:nextPageUri = ""
     LogVerbose "REST query: $requestUrl"
-    $thisPage = GetWithTrace -requestUrl $requestUrl
-    if ($null -ne $thisPage.Headers.NextPageUri)
+    $restResponse = GetWithTrace -requestUrl $requestUrl
+    if ($null -ne $restResponse.Headers.NextPageUri)
     {
-        $script:nextPageUri = $thisPage.Headers.NextPageUri
+        $script:nextPageUri = $restResponse.Headers.NextPageUri
         LogVerbose "NextPageUri: $($script:nextPageUri)"
     }
+    else {
+        LogVerbose "No NextPageUri"
+        $script:nextPageUri = $null
+    }
         
-    return $thisPage.Content
+    return $restResponse.Content
 }
 
 # Create a secret key that can be used for an Azure application
@@ -892,66 +899,61 @@ function ListContent($listContentType)
         while ( ![String]::IsNullOrEmpty($script:nextPageUri) )
         {
             $thisPageUri = $script:nextPageUri
-            $content = GetRest $script:nextPageUri # This will set nextPageUri to the next page (or null)
+            # Note that GetRest uses RetriableInvokeWebRequest, so will retry three times if there is a failure
+            $content = GetRest $thisPageUri # GetRest function will set nextPageUri to the next page (or null)
 
             if ($null -eq $content)
             {
-                # Pause one second then try again
-                $retries = 3
-                $delay = 1
-                while ($null -eq $content -and $retries -gt 0)
-                {
-                    LogVerbose "Failed to retrieve content - retrying in $delay seconds"
-                    Start-Sleep -Seconds $delay
-                    $content = GetRest $thisPageUri
-                    $retries--
-                    $delay *= 2
-                }
-                if ($null -eq $content)
-                {
-                    Log "Failed to retrieve content from $thisPageUri" Red
-                    $script:nextPageUri = $null
-                    break
-                }
+                Log "Failed to retrieve content from $thisPageUri" Red
+                $script:nextPageUri = $null
             }
-                
-            if ($null -ne $content)
+            else   
             {
-                if (!$RetrieveContent)
+                if (!$RetrieveContent -and $content.ToString() -ne "[]")
                 {
                     $content
                 }
-                else
+                $jsonContent = ConvertFrom-JSON $content
+                Log "List content: $($jsonContent.Count) content blob(s) available for download" Green
+                if ($jsonContent.Count -gt 0)
                 {
-                    $jsonContent = ConvertFrom-JSON $content
-                    Log "List content: $($jsonContent.Count) content blob(s) available for download" Green
-                    if ($jsonContent.Count -gt 0)
+                    foreach ($contentBlob in $jsonContent)
                     {
-                        foreach ($contentBlob in $jsonContent)
+                        if ($contentBlob)
                         {
-                            if ($contentBlob)
+                            if ($contentBlob.ContentUri)
                             {
-                                if ($contentBlob.ContentUri)
+                                if ($RetrieveContent)
                                 {
                                     $script:contentUrls += $contentBlob.ContentUri
                                     LogVerbose "Content Url added to retrieve list: $($contentBlob.ContentUri)"
+                                }
+                                if (![String]::IsNullOrEmpty($ExportBlobUrls))
+                                {
+                                    $contentBlob.ContentUri | Out-File -Append $ExportBlobUrls
                                 }
                             }
                         }
                     }
                 }
                 $content = $null
-                if ($thisPageUri -eq $script:nextPageUri)
+                if (![String]::IsNullOrEmpty($script:nextPageUri) -and $thisPageUri -eq $script:nextPageUri)
                 {
-                    $script:nextPageUri = $null
                     Log "Unexpected failure in nextPageUri processing - last nextPageUri is the same as this one:" Red
                     Log "Last nextPageUri: $thisPageUri"
                     Log "This nextPageUri: $($script:nextPageUri)"
+                    $script:nextPageUri = $null
                 }
             }
         }
     }
     LogVerbose "Finished ListContent for $listContentType"
+}
+
+# Ensure the export blob file is empty
+if (![String]::IsNullOrEmpty($ExportBlobUrls))
+{
+    $null | Out-File $ExportBlobUrls
 }
 
 if ([String]::IsNullOrEmpty($ContentType))
@@ -983,6 +985,7 @@ $downloadFunction = {
         $auditResponse = Invoke-WebRequest -Uri $contentUrl -Headers @{"Authorization" = $auth} -Method Get
         $auditData = $auditResponse.Content
         $downloadLog = New-Object System.Text.StringBuilder
+        $fileExtension = "json"
 
         if ($auditData.Length -gt 0)
         {
@@ -997,34 +1000,34 @@ $downloadFunction = {
                 if (![String]::IsNullOrEmpty($outputFile) -and !$outputFile.EndsWith("\")) { $outputFile = "$outputFile\" }
                 $outputFile = "$outputFile$outputFileName"
             
-                if ($(Test-Path "$outputFile.txt"))
+                if ($(Test-Path "$outputFile.$fileExtension"))
                 {
                     # Output file already exists
 
                     # We perform a sanity check here to ensure that the blob we have already retrieved is the same data
-                    $existingBlob = [IO.File]::ReadAllText("$outputFile.txt")
+                    $existingBlob = [IO.File]::ReadAllText("$outputFile.$fileExtension")
                     if (!$existingBlob.Equals($($auditData | out-string)))
                     {
                         # This data is different - which is unexpected, so we'll save it as an additional file
-                        Write-Host "Content blob is different to the one already retrieved, but should be the same: $outputFile.txt" -ForegroundColor Red
-                        $downloadLog.AppendLine("Content blob is different to the one already retrieved, but should be the same: $outputFile.txt") | out-null
+                        Write-Host "Content blob is different to the one already retrieved, but should be the same: $outputFile.$fileExtension" -ForegroundColor Red
+                        $downloadLog.AppendLine("Content blob is different to the one already retrieved, but should be the same: $outputFile.$fileExtension") | out-null
                         $i = 1
-                        while ($(Test-Path "$outputFile.$i.txt"))
+                        while ($(Test-Path "$outputFile.$i.$fileExtension"))
                             { $i++ }
                         $outputFile = "$outputFile.$i"
                     }
                     else
                     {
-                        Write-Host "Data already retrieved: $outputFile.txt"
-                        $downloadLog.AppendLine("Data already retrieved: $outputFile.txt") | out-null
+                        Write-Host "Data already retrieved: $outputFile.$fileExtension"
+                        $downloadLog.AppendLine("Data already retrieved: $outputFile.$fileExtension") | out-null
                         $outputFile = ""
                     }
                 }
                 if (![String]::IsNullOrEmpty($outputFile))
                 {
-                    Write-Host "Saving data blob to: $outputFile.txt"
-                    $downloadLog.AppendLine("Saving data blob to: $outputFile.txt") | out-null
-                    $auditData | Out-File -Filepath "$outputFile.txt" -NoClobber
+                    Write-Host "Saving data blob to: $outputFile.$fileExtension"
+                    $downloadLog.AppendLine("Saving data blob to: $outputFile.$fileExtension") | out-null
+                    $auditData | Out-File -Filepath "$outputFile.$fileExtension" -NoClobber
                 }
             }
         }
