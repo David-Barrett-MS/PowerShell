@@ -43,6 +43,13 @@ try {
     $testAppointment.Start = $startTime
     $testAppointment.End = $testAppointment.Start.AddMinutes(30)
     $testAppointment.Body = "This is a test appointment."
+    
+    # Add two user properties
+    $prop1 = $testAppointment.UserProperties.Add("TestProperty1", 1) # olText
+    $prop1.Value = "TestValue1"
+    $prop2 =$testAppointment.UserProperties.Add("TestProperty2", 5) # olDate
+    $prop2.Value = [DateTime]::Now
+
     $testAppointment.Save()        
 }
 catch {
