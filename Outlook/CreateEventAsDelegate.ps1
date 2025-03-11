@@ -13,47 +13,77 @@
 # OF LIABILITY FOR CONSEQUENTIAL OR INCIDENTAL DAMAGES, THE ABOVE LIMITATION MAY NOT APPLY TO YOU.
 
 # This script demonstrates how to create an appointment in a shared calendar using Outlook Interop.
-# Set the shared mailbox and run the script to create an appointment in the shared calendar.
-$sharedMailbox = ""
+# Shared mailbox must have permissions granted.  For example:
+# Set-MailboxFolderPermission -Identity shared@domain.com:\Calendar -User delegate@domain.com -AccessRights Editor
+
+
+param (
+    [Parameter(Position=0,Mandatory=$True,HelpMessage="Specifies the SMTP address of the mailbox where the calendar event will be created.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$SharedMailbox
+)
+
+$script:ScriptVersion = "1.0.0"
 
 # Connect to Outlook
 Add-Type -Assembly "Microsoft.Office.Interop.Outlook"
 $OutlookApp = New-Object -ComObject "Outlook.Application"
 
 # Obtain the shared calendar folder
-$sharedMailboxRecipient = $OutlookApp.Session.CreateRecipient($sharedMailbox)
+$sharedMailboxRecipient = $OutlookApp.Session.CreateRecipient($SharedMailbox)
 if (!$sharedMailboxRecipient.Resolve()) {
-    Write-Host "Failed to resolve shared mailbox recipient" -ForegroundColor Red
+    Write-Host "Failed to resolve $SharedMailbox" -ForegroundColor Red
     exit
 }
 $sharedCalendar = $OutlookApp.Session.GetSharedDefaultFolder($sharedMailboxRecipient, 9) # olFolderCalendar
 if ($null -eq $sharedCalendar)
 {
-    Write-Host "Failed to open shared calendar" -ForegroundColor Red
+    Write-Host "Failed to open shared calendar of $SharedMailbox" -ForegroundColor Red
     exit
+}
+
+function AddUserProperty($item, $name, $type, $value)
+{
+    Write-Host "Attempting to add user property $name of type $type with value $value"
+    try {
+        $prop = $item.UserProperties.Add($name, $type) # add to folder fields
+        $prop.Value = $value
+        Write-Host "Added property $name (with add to folder fields)" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Failed to add property $name (with add to folder fields)" -ForegroundColor Red
+    }
+    try {
+        $prop = $item.UserProperties.Add($name, $type, $false) # do not add to folder fields
+        $prop.Value = $value
+        Write-Host "Added property $name (without add to folder fields)" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Failed to add property $name" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+    return $false
 }
 
 # Create the draft message with extended property
 $testAppointmentSubject = "Test Meeting created at $([DateTime]::Now)"
 $startTime = [DateTime]::Now.AddHours(1)
 Write-Host "Meeting start time: $startTime"
-try {
-    $testAppointment = $sharedCalendar.Items.Add(1) # olAppointmentItem
-    $testAppointment.Subject = $testAppointmentSubject
-    $testAppointment.Start = $startTime
-    $testAppointment.End = $testAppointment.Start.AddMinutes(30)
-    $testAppointment.Body = "This is a test appointment."
-    
-    # Add two user properties
-    $prop1 = $testAppointment.UserProperties.Add("TestProperty1", 1) # olText
-    $prop1.Value = "TestValue1"
-    $prop2 =$testAppointment.UserProperties.Add("TestProperty2", 5) # olDate
-    $prop2.Value = [DateTime]::Now
+$testAppointment = $sharedCalendar.Items.Add(1) # olAppointmentItem
+$testAppointment.Subject = $testAppointmentSubject
+$testAppointment.Start = $startTime
+$testAppointment.End = $testAppointment.Start.AddMinutes(30)
+$testAppointment.Body = "This is a test appointment."
 
-    $testAppointment.Save()        
+# Add two user properties.  Type 1 = string, 5 = date
+if ((AddUserProperty $testAppointment "TestProperty1" 1 "TestValue1") -and (AddUserProperty $testAppointment  "TestProperty2" 5 $([DateTime]::Now.ToString()))) 
+{
+    $testAppointment.Save()
+    Write-Host "Created appointment with user properties: $testAppointmentSubject"
 }
-catch {
-    Write-Host "Failed to create appointment" -ForegroundColor Red
-    exit
+else {
+    Write-Host "Failed to add UserProperties, item not saved" -ForegroundColor Red
 }
-Write-Host "Created appointment: $testAppointmentSubject"
+
