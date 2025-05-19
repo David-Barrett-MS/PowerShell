@@ -25,7 +25,7 @@ Delegate permissions (requires Mail.ReadWrite):
 .\Test-MessageProcessing.ps1 -AppId $clientId -TenantId $tenantId -TestCount 1
 
 Application permissions (requires Mail.ReadWrite):
-.\Test-MessageProcessing.ps1 -mailbox $Mailbox -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey  -TestCount 1
+.\Test-MessageProcessing.ps1 -mailbox $Mailbox -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -AnalyseAttachments -RetrieveAttachmentsIndividually
 
 #>
 
@@ -51,16 +51,26 @@ param (
     [ValidateNotNullOrEmpty()]
     [string]$Mailbox = "me",
 
-    [Parameter(Mandatory=$False,HelpMessage="If specified, output will be logged to file (using same name as this script).")]
+    [Parameter(Mandatory=$False,HelpMessage="If specified, more detailed information about message attachments will be shown.")]
+    [switch]$AnalyseAttachments,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, each attachment will be retrieved by specific Id (requires -AnalyseAttachments).")]
+    [switch]$RetrieveAttachmentsIndividually,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, output will be logged to file (using same name as this script, with .log appended).")]
     [switch]$LogToFile,
 
-    [Parameter(Mandatory=$False,HelpMessage="Number of times to run the test.")]
-    [int]$TestCount = 10
+    [Parameter(Mandatory=$False,HelpMessage="If specified, all Graph calls will be logged to file (same name as script, ending in .trace).")]
+    [ValidateNotNullOrEmpty()]
+    [switch]$TraceGraphCalls
 )
 
-$script:ScriptVersion = "1.0.0"
+$script:ScriptVersion = "1.0.1"
 if ($LogToFile) {
     $script:logFile = "$($MyInvocation.InvocationName).log"
+}
+if ($TraceGraphCalls) {
+    $script:traceFile = "$($MyInvocation.InvocationName).trace"
 }
 
 Function LogToFile([string]$LogEntry)
@@ -144,9 +154,18 @@ function GET($url)
 {
     UpdateHeaders
     Write-Verbose "Calling URL: $url"
+    if ($TraceGraphCalls)
+    {
+        "GET $url" | out-file $script:traceFile -Append
+    }
     try
     {
         $result = Invoke-RestMethod -Method Get -Uri $url -Headers $script:headers
+        if ($TraceGraphCalls)
+        {
+            $result | Format-List | out-file $script:traceFile -Append
+            #"`r`n" | out-file $script:traceFile -Append
+        }
     }
     catch
     {
@@ -160,9 +179,20 @@ function PATCH($url, $body)
 {
     UpdateHeaders
     Write-Verbose "Calling URL: $url"
+    if ($TraceGraphCalls)
+    {
+        "PATCH $url" | out-file $script:traceFile -Append
+        $body | out-file $script:traceFile -Append
+        #"`r`n" | out-file $script:traceFile -Append
+    }
     try
     {
         $result = Invoke-RestMethod -Method Patch -Uri $url -Headers $script:headers -Body $body
+        if ($TraceGraphCalls)
+        {
+            $result | out-file $script:traceFile -Append
+            #"`r`n" | out-file $script:traceFile -Append
+        }
     }
     catch
     {
@@ -176,9 +206,18 @@ function DELETE($url)
 {
     UpdateHeaders
     Write-Verbose "Calling URL: $url"
+    if ($TraceGraphCalls)
+    {
+        "DELETE $url" | out-file $script:traceFile -Append
+    }
     try
     {
         $result = Invoke-RestMethod -Method Delete -Uri $url -Headers $script:headers
+        if ($TraceGraphCalls)
+        {
+            $result | out-file $script:traceFile -Append
+            #"`r`n" | out-file $script:traceFile -Append
+        }
     }
     catch
     {
@@ -334,11 +373,67 @@ if ($null -eq $attachments)
     exit # Failed to obtain message attachments
 }
 Write-Host "$($attachments.value.Count) attachments found" -ForegroundColor Green
+$global:individualAttachments = @()
+
+if ($AnalyseAttachments)
+{
+    foreach ($attachment in $attachments.value)
+    {
+        Write-Host
+        Write-Host "Attachment type: $($attachment.'@odata.type')"
+        Write-Host "Name: $($attachment.name)"
+        Write-Host "Id: $($attachment.id)"
+        Write-Host "Size: $($attachment.size)"
+        Write-Host "Content type: $($attachment.contentType)"
+        Write-Host "Content id: $($attachment.contentId)"
+        Write-Host "Content location: $($attachment.contentLocation)"
+        if ($attachment.contentBytes) {
+            Write-Host "Content bytes length: $($attachment.contentBytes.length)"
+        } else {
+            if ($attachment.'@odata.type' -ne "#microsoft.graph.itemAttachment")
+            {
+                Write-Host "Content bytes empty" -ForegroundColor Red
+            } else {
+                Write-Host "Content bytes not available (expected for item attachment)"
+            }
+        }
+        if ($RetrieveAttachmentsIndividually)
+        {
+            Write-Host "Retrieving attachment by id: $($attachment.id)"
+            if ($attachment.'@odata.type' -eq "#microsoft.graph.itemAttachment")
+            {
+                $attachmentData = GetFolderMessageById $inboxId $messageToProcess.id "attachments/$($attachment.id)/?`$expand=microsoft.graph.itemattachment/item"
+                if ($null -ne $attachmentData)
+                {
+                    Write-Host "Attached item size: $($attachmentData.size)"
+                }
+            } else {
+                $attachmentData = GetFolderMessageById $inboxId $messageToProcess.id "attachments/$($attachment.id)"
+            }
+            if ($null -eq $attachmentData)
+            {
+                Write-Host "Failed to obtain attachment by id: $($attachment.id)" -ForegroundColor Red
+            } else {
+                $global:individualAttachments += $attachmentData
+            }
+        }
+    }
+    Write-Host
+}
+
 
 # DELETE /mailfolders/inbox(by Id)/MessageID
 #DeleteFolderMessageById $inboxId $messageToProcess.id
 
 Write-Host "Completed"
-Write-Host "`$messageToProcess contains the message that was processed"
-Write-Host "`$updatedMessage contains the message after marked as read"
-Write-Host "`$attachments contains the attachments for the message that was processed"
+Write-Host "`$messageToProcess" -NoNewline -ForegroundColor Green
+Write-Host " contains the message that was processed"
+Write-Host "`$updatedMessage" -NoNewline -ForegroundColor Green
+Write-Host " contains the message after marked as read"
+Write-Host "`$attachments" -NoNewline -ForegroundColor Green
+Write-Host " contains the attachments for the message that was processed"
+if ($RetrieveAttachmentsIndividually)
+{
+    Write-Host "`$individualAttachments" -NoNewline -ForegroundColor Green
+    Write-Host " contains the attachments retrieved individually"
+}
