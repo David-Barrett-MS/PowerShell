@@ -51,21 +51,32 @@ param (
     [ValidateNotNullOrEmpty()]
     [string]$Mailbox = "me",
 
+    [Parameter(Mandatory=$False,HelpMessage="If specified, MIME for the message will be requested (using `$value Graph call).")]
+    [switch]$RetrieveFullMIME,
+
     [Parameter(Mandatory=$False,HelpMessage="If specified, more detailed information about message attachments will be shown.")]
     [switch]$AnalyseAttachments,
 
     [Parameter(Mandatory=$False,HelpMessage="If specified, each attachment will be retrieved by specific Id (requires -AnalyseAttachments).")]
     [switch]$RetrieveAttachmentsIndividually,
 
+    [Parameter(Mandatory=$False,HelpMessage="Timeout for HTTP requests (default is 30 seconds, which is same as Microsoft Graph endpoint).  Only works for Powershell 7.4+ (prior to that, timeout is infinite).")]
+    [ValidateRange(0,300)]
+    [int]$ConnectionTimeout = 30,
+
     [Parameter(Mandatory=$False,HelpMessage="If specified, output will be logged to file (using same name as this script, with .log appended).")]
     [switch]$LogToFile,
 
     [Parameter(Mandatory=$False,HelpMessage="If specified, all Graph calls will be logged to file (same name as script, ending in .trace).")]
     [ValidateNotNullOrEmpty()]
-    [switch]$TraceGraphCalls
+    [switch]$TraceGraphCalls,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, the message will not be marked as read after processing.")]
+    [ValidateNotNullOrEmpty()]
+    [switch]$DoNotMarkUnread
 )
 
-$script:ScriptVersion = "1.0.1"
+$script:ScriptVersion = "1.0.2"
 if ($LogToFile) {
     $script:logFile = "$($MyInvocation.InvocationName).log"
 }
@@ -128,7 +139,7 @@ function RenewOAuthToken()
         Write-Host "Failed to renew OAuth token" -ForegroundColor Red
         exit # Failed to renew the token
     }
-    Write-Host "Successfully renewed OAuth token" -ForegroundColor Green
+    Write-Host "Successfully renewed OAuth token"
 }
 
 function UpdateHeaders()
@@ -150,81 +161,108 @@ function UpdateHeaders()
 
 }
 
-function GET($url)
+function TraceInvokeRestMethod($method, $url, $body)
 {
     UpdateHeaders
     Write-Verbose "Calling URL: $url"
     if ($TraceGraphCalls)
     {
-        "GET $url" | out-file $script:traceFile -Append
+        "$method $url" | out-file $script:traceFile -Append
     }
     try
     {
-        $result = Invoke-RestMethod -Method Get -Uri $url -Headers $script:headers
+        $result = $null
+        $invokeParameters = @{
+            Method = $method
+            Uri = $url
+            Headers = $script:headers
+            ContentType = "application/json"
+        }
+        if ($PSVersionTable.PSVersion.Major -ge 7 -and $PSVersionTable.PSVersion.Minor -ge 4)
+        {
+            # PowerShell 7.4+ supports ConnectionTimeoutSeconds
+            $invokeParameters.ConnectionTimeoutSeconds = $ConnectionTimeout
+        }
+
+        if ($method -eq "POST" -or $method -eq "PATCH")
+        {
+            $jsonBody = $body | ConvertTo-Json -Depth 10
+            if ($TraceGraphCalls)
+            {
+                "`r`n$jsonBody" | out-file $script:traceFile -Append
+            }
+            $invokeParameters.Body = $jsonBody
+        }
+        $result = Invoke-WebRequest @invokeParameters
         if ($TraceGraphCalls)
         {
-            $result | Format-List | out-file $script:traceFile -Append
-            #"`r`n" | out-file $script:traceFile -Append
+            "" | out-file $script:traceFile -Append
+            $result.RawContent | out-file $script:traceFile -Append
+            "`r`n" | out-file $script:traceFile -Append
         }
     }
     catch
     {
-        Write-Host "Failed to obtain data from URL: $url" -ForegroundColor Red
+        if ($TraceGraphCalls)
+        {
+            if ($result) {
+                if ($result.RawContent) {
+                    "" | out-file $script:traceFile -Append
+                    $result.RawContent | out-file $script:traceFile -Append
+                    "`r`n" | out-file $script:traceFile -Append
+                }
+                else {
+                    $result | out-file $script:traceFile -Append
+                }                
+            }
+            else {
+                if ($Error[0].Exception.Response)
+                {
+                    $headers = $Error[0].Exception.Response.Headers
+                    if ($headers -and $headers.Count -gt 0) {
+                        for ($i=0; $i -lt $headers.Count; $i++)
+                        {
+                            "$($headers.Keys[$i]): $($headers[$i])" | out-file $script:traceFile -Append
+                        }
+                        "" | out-file $script:traceFile -Append
+                    }
+                    else {
+                        Write-Host "No response headers returned" -ForegroundColor Red
+                    }
+                }
+                else {
+                    Write-Host "No further error details available" -ForegroundColor Red
+                }                
+            }
+            $Error[0] | out-file $script:traceFile -Append
+        }
+        Write-Host "$method failed to URL: $url" -ForegroundColor Red
         exit
     }
-    return $result
+    return $result.Content
+}
+
+function GET($url)
+{
+    $result = TraceInvokeRestMethod "GET" $url $null
+    return ConvertFrom-Json $result
+}
+
+function rawGET($url)
+{
+    return TraceInvokeRestMethod "GET" $url $null
 }
 
 function PATCH($url, $body)
 {
-    UpdateHeaders
-    Write-Verbose "Calling URL: $url"
-    if ($TraceGraphCalls)
-    {
-        "PATCH $url" | out-file $script:traceFile -Append
-        $body | out-file $script:traceFile -Append
-        #"`r`n" | out-file $script:traceFile -Append
-    }
-    try
-    {
-        $result = Invoke-RestMethod -Method Patch -Uri $url -Headers $script:headers -Body $body
-        if ($TraceGraphCalls)
-        {
-            $result | out-file $script:traceFile -Append
-            #"`r`n" | out-file $script:traceFile -Append
-        }
-    }
-    catch
-    {
-        Write-Host "Failed to obtain data from URL: $url" -ForegroundColor Red
-        exit
-    }
-    return $result
+    $result = TraceInvokeRestMethod "PATCH" $url $body
+    return ConvertFrom-Json $result
 }
 
 function DELETE($url)
 {
-    UpdateHeaders
-    Write-Verbose "Calling URL: $url"
-    if ($TraceGraphCalls)
-    {
-        "DELETE $url" | out-file $script:traceFile -Append
-    }
-    try
-    {
-        $result = Invoke-RestMethod -Method Delete -Uri $url -Headers $script:headers
-        if ($TraceGraphCalls)
-        {
-            $result | out-file $script:traceFile -Append
-            #"`r`n" | out-file $script:traceFile -Append
-        }
-    }
-    catch
-    {
-        Write-Host "Failed to obtain data from URL: $url" -ForegroundColor Red
-        exit
-    }
-    return $result
+    $result = TraceInvokeRestMethod "DELETE" $url $null
+    return ConvertFrom-Json $result
 }
 
 function GetMailboxFolder($queryString)
@@ -244,7 +282,7 @@ function MarkMessageAsRead($messageId)
     $url = $script:graphBaseUrl + "messages/$messageId"
     $body = @{
         isRead = $true
-    } | ConvertTo-Json
+    }
     return PATCH $url $body
 }
 
@@ -264,6 +302,18 @@ function DeleteFolderMessageById($folderId, $messageId)
 {
     $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId"
     return DELETE $url
+}
+
+function GetMessageById($messageId, $queryString)
+{
+    $url = $script:graphBaseUrl + "messages/$messageId/$queryString"
+    return GET $url
+}
+
+function GetMessageMIMEById($messageId, $queryString)
+{
+    $url = $script:graphBaseUrl + "messages/$messageId/$queryString"
+    return rawGET $url
 }
 
 ## Authentication
@@ -305,7 +355,7 @@ else
 {
     GetAppAuthToken
 }
-Write-Host "Successfully obtained OAuth token" -ForegroundColor Green
+Write-Host "Successfully obtained OAuth token"
 
 # GET /mailFolders/?$filter=displayName+eq+'INBOX'
 $inbox = GetMailboxFolder("?`$filter=displayName eq 'INBOX'")
@@ -315,7 +365,7 @@ if ($null -eq $inbox)
     exit # Failed to obtain inbox folder
 }
 $inboxId = $inbox.value.id
-Write-Host "Inbox folder id: $($inboxId)" -ForegroundColor Green
+Write-Host "Inbox folder id: $($inboxId)"
 
 # GET /mailfolders/inbox/messages/?$filter=isRead+eq+false&$count=true&$top=20&$orderBy=receivedDateTime&select=internetMessageId,id
 $unreadMessages = GetFolderMessages $inboxId "?`$filter=isRead eq false&`$count=true&`$top=20&`$orderBy=receivedDateTime&select=internetMessageId,id"
@@ -329,23 +379,26 @@ if ($unreadMessages.value.Count -eq 0)
     Write-Host "No unread messages to process" -ForegroundColor Yellow
     exit # No unread messages to process
 }
-Write-Host "$($unreadMessages.value.Count) unread messages found" -ForegroundColor Green
+Write-Host "$($unreadMessages.value.Count) unread messages found"
 
 $global:messageToProcess = $unreadMessages.value[0]
+
 # PATCH message (mark as read)
 if ($null -eq $messageToProcess)
 {
     Write-Host "Failed to obtain message to process" -ForegroundColor Red
     exit # Failed to obtain message to process
 }
-$global:updatedMessage = MarkMessageAsRead $messageToProcess.id
-if ($null -eq $updatedMessage)
+if (!$DoNotMarkUnread)
 {
-    Write-Host "Failed to update message" -ForegroundColor Red
-    exit # Failed to update message
+    $global:updatedMessage = MarkMessageAsRead $messageToProcess.id
+    if ($null -eq $updatedMessage)
+    {
+        Write-Host "Failed to update message" -ForegroundColor Red
+        exit # Failed to update message
+    }
+    Write-Host "Message marked as read: $($updatedMessage.subject)"
 }
-Write-Host "Message marked as read: $($updatedMessage.subject)" -ForegroundColor Green
-
 
 # GET /mailFolders/?$filter=displayName+eq+'INBOX'
 $inbox = GetMailboxFolder("?`$filter=displayName eq 'INBOX'")
@@ -355,7 +408,7 @@ if ($null -eq $inbox)
     exit # Failed to obtain inbox folder
 }
 $inboxId = $inbox.value.id
-Write-Host "Inbox folder id: $($inboxId)" -ForegroundColor Green
+Write-Host "Inbox folder id: $($inboxId)"
 
 # GET /mailfolders/inbox(by Id)/MessageID?$select=*
 $message = GetFolderMessageById $inboxId $messageToProcess.id "?`$select=*"
@@ -372,7 +425,7 @@ if ($null -eq $attachments)
     Write-Host "Failed to obtain message attachments" -ForegroundColor Red
     exit # Failed to obtain message attachments
 }
-Write-Host "$($attachments.value.Count) attachments found" -ForegroundColor Green
+Write-Host "$($attachments.value.Count) attachments found"
 $global:individualAttachments = @()
 
 if ($AnalyseAttachments)
@@ -412,7 +465,14 @@ if ($AnalyseAttachments)
             }
             if ($null -eq $attachmentData)
             {
-                Write-Host "Failed to obtain attachment by id: $($attachment.id)" -ForegroundColor Red
+                $attachmentData = GetMessageById $messageToProcess.id "attachments/$($attachment.id)"
+                if ($null -ne $attachmentData)
+                {
+                    Write-Host "Successfully obtained attachment by id (excluding folder path): $($attachment.id)" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host "Failed to obtain attachment by id: $($attachment.id)" -ForegroundColor Red
+                }                
             } else {
                 $global:individualAttachments += $attachmentData
             }
@@ -421,11 +481,22 @@ if ($AnalyseAttachments)
     Write-Host
 }
 
+if ($RetrieveFullMIME)
+{
+    # GET /mailFolders/inbox(by Id)/MessageID/$value
+    Write-Host "Retrieving full MIME for message id: $($messageToProcess.id)"
+    $global:fullMIME = GetMessageMIMEById $messageToProcess.id "`$value"
+    if ($null -eq $fullMIME)
+    {
+        Write-Host "Failed to obtain full MIME" -ForegroundColor Red
+    }
+    Write-Host "Full MIME length: $($global:fullMIME.length)"
+}
 
 # DELETE /mailfolders/inbox(by Id)/MessageID
 #DeleteFolderMessageById $inboxId $messageToProcess.id
 
-Write-Host "Completed"
+Write-Host "`r`nCompleted`r`n"
 Write-Host "`$messageToProcess" -NoNewline -ForegroundColor Green
 Write-Host " contains the message that was processed"
 Write-Host "`$updatedMessage" -NoNewline -ForegroundColor Green
@@ -436,4 +507,9 @@ if ($RetrieveAttachmentsIndividually)
 {
     Write-Host "`$individualAttachments" -NoNewline -ForegroundColor Green
     Write-Host " contains the attachments retrieved individually"
+}
+if ($RetrieveFullMIME)
+{
+    Write-Host "`$fullMIME" -NoNewline -ForegroundColor Green
+    Write-Host " contains the full MIME for the message that was processed"
 }
