@@ -2,6 +2,10 @@ param (
 	[Parameter(Mandatory=$True,HelpMessage="Path from which to read event logs")]
 	[ValidateNotNullOrEmpty()]
 	[string]$SourceFolder,
+	
+	[Parameter(Mandatory=$False,HelpMessage="File mask to filter files that will be ingested (default is *.json)")]
+	[ValidateNotNullOrEmpty()]
+	[string]$FileMask = "*.json",	
 
 	[Parameter(Mandatory=$False,HelpMessage="If specified, events from the API feed are deduplicated.")]
 	[ValidateNotNullOrEmpty()]
@@ -20,7 +24,7 @@ $global:events = @()
 $eventIds = @()
 $duplicateCount = 0
 
-dir "$SourceFolder\*.json" | foreach {
+dir "$SourceFolder\$FileMask" | foreach {
     $fileContent = Get-Content $_
     $fileEvents = ConvertFrom-Json $fileContent
     foreach ($fileEvent in $fileEvents) {
@@ -41,11 +45,11 @@ dir "$SourceFolder\*.json" | foreach {
     }
 }
 if ($Deduplicate) {
-	Write-Host "$duplicateCount duplicates ignored from API data"
+	Write-Host "$duplicateCount duplicate(s) ignored from API data"
 }
 if ($global:events.Count -lt 1)
 {
-    Write-Host "Failed to read any events" -ForegroundColor Red
+    Write-Host "No events read" -ForegroundColor Red
     exit
 }
 
@@ -104,7 +108,7 @@ if ($CompareBothWays) {
 	
 	if ($global:missingPurviewEvents.Count -gt 0) {
 		Write-Host "$($global:missingPurviewEvents.Count) API event(s) missing from Purview export (stored in `$missingPurviewEvents)"
-		Write-Host "It is usually expected that the imported API feed will contain many more audit events than the Purview export."
+		Write-Host "It is usually expected that the imported API feed will contain many more audit events than a Purview export."
 	} else {
 		Write-Host "No events missing from Purview export" -ForegroundColor Green
 	}
@@ -117,21 +121,3 @@ if ($global:missingAPIEvents.Count -gt 0) {
 }
 
 Write-Host "API events are available in `$events"
-
-
-<#
-$events | where-object -FilterScript { $_.recordtype -eq 84 -or $_.recordtype -eq 83 -or $_.recordtype -eq 43} | ft
-
-CreationTime        Id                                   Operation                    OrganizationId
-------------        --                                   ---------                    --------------
-2022-11-17T12:41:41 2c0e208e-0284-41d7-b3ac-218ea8b07bf1 MipLabel                     fc69f6a8-90cd-4047-977d-0c768925b8ec
-2022-11-17T11:08:53 48796a12-c5b1-4ad6-b9b1-0eb9d919f212 SensitivityLabelApplied      fc69f6a8-90cd-4047-977d-0c768925b8ec
-2022-11-17T11:08:14 8ebb2619-956c-446e-a931-acdd4c7fa226 SensitivityLabelApplied      fc69f6a8-90cd-4047-977d-0c768925b8ec
-2022-11-17T12:38:04 bb682ce7-573f-4aba-b420-7996aeae7094 SensitivityLabelApplied      fc69f6a8-90cd-4047-977d-0c768925b8ec
-2022-11-17T12:40:45 a474e8ba-faab-4e94-b8b9-ea6595ebb92e SensitivityLabelRemoved      fc69f6a8-90cd-4047-977d-0c768925b8ec
-2022-11-17T12:40:26 120d8aa3-3133-4f4f-96b6-7bb14ee8c74b SensitivityLabeledFileOpened fc69f6a8-90cd-4047-977d-0c768925b8ec
-2022-11-17T12:41:36 fd65bc3e-a8b9-4548-9869-5d22dcb7d5c4 SensitivityLabelApplied      fc69f6a8-90cd-4047-977d-0c768925b8ec
-
-$events | where-object -FilterScript { $_.recordtype -eq 84 -or $_.recordtype -eq 83 -or $_.recordtype -eq 43} | export-csv "o365api.csv" -NoTypeInformation
-
-#>
