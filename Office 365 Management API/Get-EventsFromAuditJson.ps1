@@ -3,6 +3,10 @@ param (
 	[ValidateNotNullOrEmpty()]
 	[string]$SourceFolder,
 
+	[Parameter(Mandatory=$False,HelpMessage="If specified, events from the API feed are deduplicated.")]
+	[ValidateNotNullOrEmpty()]
+	[switch]$Deduplicate,
+	
 	[Parameter(Mandatory=$False,HelpMessage="If specified, this file (export from Purview Portal) will be tested to check the API feed contains the same events")]
 	[ValidateNotNullOrEmpty()]
 	[string]$PurviewExportCompare,
@@ -13,14 +17,31 @@ param (
 )
 
 $global:events = @()
+$eventIds = @()
+$duplicateCount = 0
 
 dir "$SourceFolder\*.json" | foreach {
     $fileContent = Get-Content $_
     $fileEvents = ConvertFrom-Json $fileContent
     foreach ($fileEvent in $fileEvents) {
-        Add-Member -InputObject $fileEvent -Type NoteProperty -PassThru -Name 'SourceAuditFile' -Value "$($_.Name)" | out-null
-        $global:events += $fileEvent
+		$addEvent = $true
+		if ($Deduplicate) {
+			if ($eventIds.Contains($fileEvent.Id)) {
+				Write-Verbose "Duplicate event ignored: $($fileEvent.Id)"
+				$addEvent = $false
+				$duplicateCount++
+			} else {
+				$eventIds += $fileEvent.Id
+			}
+		}
+		if ($addEvent) {
+			Add-Member -InputObject $fileEvent -Type NoteProperty -PassThru -Name 'SourceAuditFile' -Value "$($_.Name)" | out-null
+			$global:events += $fileEvent
+		}
     }
+}
+if ($Deduplicate) {
+	Write-Host "$duplicateCount duplicates ignored from API data"
 }
 if ($global:events.Count -lt 1)
 {
@@ -50,7 +71,7 @@ Write-Host "API data contains $($global:events.Count) event(s)"
 $global:missingAPIEvents = @()
 foreach ($purviewevent in $purviewevents) {	
 	$foundAPIEvent = $false
-	foreach ($apievent in $powerevents) {
+	foreach ($apievent in $global:events) {
 		if ($apievent.Id -eq $purviewevent.RecordId) {
 			Write-Verbose "Found $($apievent.Id)"
 			$foundAPIEvent = $true
@@ -95,7 +116,7 @@ if ($global:missingAPIEvents.Count -gt 0) {
 	Write-Host "No events missing from API feed" -ForegroundColor Green
 }
 
-Write-Host "All API events are available in `$events (which hasn't been deduplicated)"
+Write-Host "API events are available in `$events"
 
 
 <#
