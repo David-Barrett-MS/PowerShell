@@ -6,7 +6,7 @@ param (
 
 $global:events = @()
 
-dir "$SourceFolder\*.txt" | foreach {
+dir "$SourceFolder\*.json" | foreach {
     $fileContent = Get-Content $_
     $fileEvents = ConvertFrom-Json $fileContent
     foreach ($fileEvent in $fileEvents) {
@@ -42,4 +42,46 @@ CreationTime        Id                                   Operation              
 2022-11-17T12:41:36 fd65bc3e-a8b9-4548-9869-5d22dcb7d5c4 SensitivityLabelApplied      fc69f6a8-90cd-4047-977d-0c768925b8ec
 
 $events | where-object -FilterScript { $_.recordtype -eq 84 -or $_.recordtype -eq 83 -or $_.recordtype -eq 43} | export-csv "o365api.csv" -NoTypeInformation
+
+
+
+$powerevents = $events | where-object -FilterScript { $_.Workload.StartsWith("PowerPlatform") }
+$purviewevents = Import-CSV  -Path "E:\Scripts\demonmaths.co.uk\Analysis\From Purview. (PowerPlatform workload)csv.csv"
+
+# Check each API event is present in Purview export
+$missingEvents = @()
+foreach ($powerevent in $powerevents) {
+	$foundPurviewEvent = $false
+	foreach ($purviewevent in $purviewevents) {
+		if ($powerevent.Id -eq $purviewevent.RecordId) {
+			Write-Host "Found $($purviewevent.RecordId)" -ForegroundColor Green
+			$foundPurviewEvent = $true
+			break;
+		}
+	}
+	if (!$foundPurviewEvent) {
+		$missingEvents += $powerevent
+		Write-Host "Missing from Purview: $($powerevent.Id)" -ForegroundColor Red
+	}
+}
+
+# Check each Purview event is present in API feed
+$missingEvents = @()
+foreach ($purviewevent in $purviewevents) {	
+	$foundAPIEvent = $false
+	foreach ($powerevent in $powerevents) {
+		if ($powerevent.Id -eq $purviewevent.RecordId) {
+			Write-Host "Found $($powerevent.Id)" -ForegroundColor Green
+			$foundAPIEvent = $true
+			break;
+		}
+	}
+	if (!$foundAPIEvent) {
+		$missingEvents += $purviewevent
+		Write-Host "Missing from API: $($purviewevent.RecordId)" -ForegroundColor Red
+	}
+}
+
+
+
 #>
