@@ -107,24 +107,13 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="If specified, this is the start of the time range that will be requested.  Do not use with -ListContentDate.")]
     $ListContentEndTime,
 
-    [Parameter(Mandatory=$False,HelpMessage="If specified, the script attempts to register an application in Azure using the given parameters (and with permission to access Management API logs)")]
-    [switch]$RegisterAzureApplication,
-
-    [Parameter(Mandatory=$False,HelpMessage="Name of the application to register in Azure (required when -RegisterAzureApplication specified)")]
-    [ValidateNotNullOrEmpty()]
-    [string]$AzureApplicationName = "",
-
-    [Parameter(Mandatory=$False,HelpMessage="Permissions that the application will require (these are all application permissions as this script authenticates as application)")]
-    [ValidateNotNullOrEmpty()]
-    $AzureApplicationRequiredPermissions = @("ActivityFeed.Read", "ActivityFeed.ReadDlp", "ServiceHealth.Read"),
-
     [Parameter(Mandatory=$False,HelpMessage="Log file - activity is logged to this file")]	
     [string]$LogFile = "",
 
     [Parameter(Mandatory=$False,HelpMessage="HTTP trace file - all HTTP request and responses will be logged to this file")]	
     [string]$DebugPath = ""
 )
-$script:ScriptVersion = "1.1.9"
+$script:ScriptVersion = "1.2.0"
 
 # We work out the root Uri for our requests based on the tenant Id
 $rootUri = "https://manage.office.com/api/v1.0/$tenantId/activity/feed"
@@ -505,189 +494,12 @@ Function GetRest
     return $restResponse.Content
 }
 
-# Create a secret key that can be used for an Azure application
-Function CreateSecretKey
-{
-    $aes = New-Object System.Security.Cryptography.AesManaged
-    $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
-    $aes.Padding = [System.Security.Cryptography.PaddingMode]::Zeros
-    $aes.BlockSize = 128
-    $aes.KeySize = 256
-    $aes.GenerateKey()
-    return [System.Convert]::ToBase64String($aes.Key)
-}
-
-# Create a certificate used to authenticate with Azure.  
-Function CreateAuthCertificate
-{
-    # Not implemented
-    makecert -r -pe -n "CN=MyCompanyName MyAppName Cert" -b 03/15/2015 -e 03/15/2017 -ss my -len 2048
-}
-
-# Create application key that can be used for an Azure application
-Function CreateAppKey([DateTime] $ValidFromDate, [double] $DurationInYears, [string]$SecretKey)
-{
-    $key = New-Object Microsoft.Open.AzureAD.Model.PasswordCredential
-    $key.StartDate = $ValidFromDate
-    $key.EndDate = $ValidFromDate.AddYears($DurationInYears) 
-    $key.Value = $SecretKey
-    $key.KeyId = (New-Guid).ToString()
-    return $key
-}
-
-Function CreatePermissionSet([string] $ResourceDisplayName, [string[]]$Permissions, [string[]]$PermissionTypes)
-{
-    # Get information about the resource (which will include available permissions)
-    $resourceSP = $null
-    $resourceSP = Get-AzureADServicePrincipal -Filter "DisplayName eq '$resourceDisplayName'"
-    if (!$resourceSP)
-    {
-        Log "Failed to locate resource API: $resourceDisplayName" Red
-        return $false
-    }
-
-    # Create a RequiredResourceAccess object (this will be used to specify the permissions that our application needs)
-    $requiredResourceAccess = New-Object Microsoft.Open.AzureAD.Model.RequiredResourceAccess
-    $requiredResourceAccess.ResourceAppId = $resourceSP.AppId
-    $requiredResourceAccess.ResourceAccess = New-Object System.Collections.Generic.List[Microsoft.Open.AzureAD.Model.ResourceAccess]
-
-    # $Permissions contains our list of permissions, while $PermissionTypes defines what type we need ("Scope" is for delegated permissions, while "Role" is for application permissions)
-    $i = 0
-    while ($i -lt $Permissions.Length)
-    {
-        # Find the matching permission from our resource (if we can't find it, it isn't a valid permission)
-        $permissionFound = $false
-        foreach ($resourcePermission in $resourceSP.OAuth2Permissions)
-        {
-            if ($resourcePermission.Value -eq $Permissions[$i])
-            {
-                # This is the permission that our application needs
-                $permissionFound = $true
-                $resourceAccess = New-Object Microsoft.Open.AzureAD.Model.ResourceAccess
-                
-                if ($PermissionTypes.Length -eq 1)
-                {
-                    $resourceAccess.Type = $PermissionTypes[0]
-                    LogVerbose "Adding permission: $($resourcePermission.Value); Scope: $($PermissionTypes[0])"
-                }
-                else
-                {
-                    $resourceAccess.Type = $PermissionTypes[$i]
-                    LogVerbose "Adding permission: $($resourcePermission.Value); Scope: $($PermissionTypes[$i])"
-                }
-                $resourceAccess.Id = $resourcePermission.Id # This is the Id of the permission we are requesting, as read from Azure
-                $requiredResourceAccess.ResourceAccess.Add($resourceAccess)
-                break
-            }
-        }
-        if (!$permissionFound)
-        {
-            Log "$ResourceDisplayName does not expose the permission: $($Permissions[$i])" Yellow
-        }
-        $i++
-    }
-
-    return $requiredResourceAccess
-}
-
 # Register Azure application with correct permissions
 Function RegisterAzureApplication
 {
-    # Check we have Azure AD module available
-    $azureAD = Get-Module AzureAD -ListAvailable
-    if (!$azureAD)
-    {
-        Log "AzureAD module not available, attempting to install" Yellow
-        try
-        {
-            Install-Module "AzureAD"
-            $azureAD = Get-Module AzureAD -ListAvailable
-        }
-        catch
-        {
-            Log "Failed to install AzureAD module, which is required to register Azure applications" Red
-            Exit
-        }
-    }
-    Import-Module $azureAD
-
-    LogVerbose "Attempting to register application in Azure"
-
-    # Connect to Azure AD and obtain tenant information
-    $tenant = $null
-    if (![String]::IsNullOrEmpty($TenantId))
-    {
-        # If TenantId has been specified, we always connect to Azure AD (to ensure we have the right tenant)
-        Connect-AzureAD -TenantId $TenantId | out-null
-    }
-    else
-    {
-        # When no tenant is specified, we only connect to Azure AD if we don't already have tenant information (i.e. are not logged on)
-        try
-        {
-            $tenant = Get-AzureADTenantDetail
-        } catch {}
-        if ($null -eq $tenant)
-        {
-            Connect-AzureAD | out-null
-        }
-    }
-    if ($null -eq $tenant)
-    {
-        try
-        {
-            $tenant = Get-AzureADTenantDetail
-        } catch {}
-        if ($null -eq $tenant)
-        {
-            Log "Failed to connect to Azure tenant" Red
-            return
-        }
-    }
-    
-    # If we get here, then we have successfully logged onto a tenant
-    $tenantName =  ($tenant.VerifiedDomains | Where-Object { $_._Default -eq $True }).Name
-    LogVerbose "Will register application in tenant: $tenantName"
-    if ([String]::IsNullOrEmpty($TenantId))
-    {
-        $TenantId = $tenant.ObjectId
-        Log "Tenant id: $TenantId"
-    }
-
-    # Create the Azure application
-    LogVerbose "Creating the Azure application: $AzureApplicationName"
-
-    if ([String]::IsNullOrEmpty($AppSecretKey))
-    {
-        # No secret key specified, so we create one
-        $AppSecretKey = CreateSecretKey
-        Log "Application secret key generated: $AppSecretKey`r`n"
-    }
-    
-    $appRegKey = CreateAppKey -ValidFromDate $([DateTime]::Now) -DurationInYears 2 -SecretKey $AppSecretKey
-    $azureApplication = New-AzureADApplication -DisplayName "$AzureApplicationName" -HomePage "http://localhost/$AzureApplicationName" -IdentifierUris "https://$tenantName/$AzureApplicationName" -PasswordCredentials $appRegKey -PublicClient $False -ReplyUrls @("$AppRedirectURI")
-    if (!$azureApplication)
-    {
-        Log "Failed to create Azure application" Red
-        return
-    }
-    New-AzureADServicePrincipal -AppId $($azureApplication.AppId) -Tags {WindowsAzureActiveDirectoryIntegratedApp} | out-null # This is required to make the application visible in the App Registrations (v1) blade in Azure AD
-    Log "Azure application created; Id: $($azureApplication.AppId)"
-    
-    # Add Required Resources Access (from application to the Management API)
-    LogVerbose "Getting access from '$AzureApplicationName' to 'Office 365 Management APIs'"
-    $requiredPermissions = CreatePermissionSet -ResourceDisplayName "Office 365 Management APIs" -Permissions $AzureApplicationRequiredPermissions -PermissionTypes @("Role")
-    if ($requiredPermissions -eq $false)
-    {
-        Log "Unable to build permission list for application.  Registration has been successful, but no permissions assigned." Red
-        return
-    }
-
-    LogVerbose "Setting requested permissions on Azure application"
-    $requiredResourcesAccess = New-Object System.Collections.Generic.List[Microsoft.Open.AzureAD.Model.RequiredResourceAccess]
-    $requiredResourcesAccess.Add($requiredPermissions)
-    Set-AzureADApplication -ObjectId $azureApplication.ObjectId -RequiredResourceAccess $requiredResourcesAccess | out-null
-    Log "Application created and permissions have been set - please grant permissions via the Azure Portal.  NOTE THE SECRET KEY, as it cannot be recovered if lost (though a new one can be created)."
+    Write-Host "Azure AD PowerShell is no longer supported, so this functionality has been removed" -ForegroundColor Red
+    Write-Host "While an application can now be registered using Microsoft Graph, this in itself requires an application registration so implementation here doesn't make sense"
+    exit
 }
 
 
@@ -696,18 +508,6 @@ Function RegisterAzureApplication
 # Main script
 #
 ########################################################
-
-########################################################
-#
-# Register Azure Application
-#
-########################################################
-
-if ($RegisterAzureApplication)
-{
-    RegisterAzureApplication
-    Exit
-}
 
 ########################################################
 #
@@ -914,7 +714,7 @@ function ListContent($listContentType)
                     $content
                 }
                 $jsonContent = ConvertFrom-JSON $content
-                Log "List content: $($jsonContent.Count) content blob(s) available for download" Green
+                Log "List content: $($jsonContent.Count) $listContentType content blob(s) available for download" Green
                 if ($jsonContent.Count -gt 0)
                 {
                     foreach ($contentBlob in $jsonContent)
