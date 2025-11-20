@@ -77,7 +77,7 @@ param (
     [string]$FilterSpecificValue = ""
 )
 
-$script:ScriptVersion = "1.0.0"
+$script:ScriptVersion = "1.0.1"
 
 <# Logging.ps1 %FUNCTIONS_START% #>
 if ($LogToFile) {
@@ -346,72 +346,6 @@ function DELETE($url)
 function rawGET($url)
 {
     return TraceInvokeRestMethod "GET" $url $null
-}
-
-function GetMailboxFolder($queryString)
-{
-    $url = $script:graphBaseUrl + "mailFolders$queryString"
-    $response = GET $url
-    if ($null -eq $response)
-    {
-        return $null
-    }
-    return ConvertFrom-Json ($response)
-}
-
-function GetFolderMessages($folderId, $queryString)
-{
-    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages$queryString"
-    $response = GET $url
-    if ($null -eq $response)
-    {
-        return $null
-    }
-    return ConvertFrom-Json ($response)
-}
-
-function GetMessages($queryString)
-{
-    $url = $script:graphBaseUrl + "messages$queryString"
-    $response = GET $url
-    if ($null -eq $response)
-    {
-        return $null
-    }    
-    return ConvertFrom-Json ($response)
-}
-
-function GetFolderMessageById($folderId, $messageId, $queryString)
-{
-    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId$queryString"
-    $response = GET $url
-    if ($null -eq $response)
-    {
-        return $null
-    }    
-    return ConvertFrom-Json ($response)
-}
-
-function GetFolderMessageByIdAttachments($folderId, $messageId)
-{
-    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId/attachments"
-    $response = GET $url
-    if ($null -eq $response)
-    {
-        return $null
-    }    
-    return ConvertFrom-Json ($response)
-}
-
-function DeleteFolderMessageById($folderId, $messageId)
-{
-    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId"
-    $response = DELETE $url
-    if ($null -eq $response)
-    {
-        return $null
-    }    
-    return $response
 }
 
 <# Graph.ps1 %FUNCTIONS_END% #>
