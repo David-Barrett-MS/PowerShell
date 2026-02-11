@@ -25,7 +25,12 @@ and a secret key - pass the relevant information via parameters.  A test message
 mailbox.
 
 .EXAMPLE
-.\sendMail.ps1 -AppId "<AppId>" -TenantId "<TenantId>" -AppSecretKey "<AppSecretKey>" -Mailbox "<mailbox>"
+# Send simple HTML message to self using application permissions
+.\sendMail.ps1 -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -Mailbox $Mailbox
+
+# Send adaptive card in message to self
+$cardContent = Get-Content "c:\temp\adaptiveCard.json" -Raw
+.\sendMail.ps1 -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -Mailbox $Mailbox -AdaptiveCardPayload $cardContent
 
 #>
 
@@ -47,12 +52,32 @@ param (
 	[ValidateNotNullOrEmpty()]
 	[string]$Mailbox,
 
-	[Parameter(Mandatory=$False,HelpMessage="If specified, this picture will be attached to the message.")]
-	[string]$AttachPicture,
+    [Parameter(Mandatory=$False,HelpMessage="If specified, message is sent to this recipient instead of the mailbox owner.")]
+    [string]$Recipient = "",
 
-	[Parameter(Mandatory=$False,HelpMessage="If specified, this is the HTML body of the message.")]
-	[string]$MessageHTML
+    [Parameter(Mandatory=$False,HelpMessage="If specified, this picture will be attached to the message.")]
+    [string]$AttachPicture,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, this is the HTML body of the message.")]
+    [string]$MessageHTML = "",
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, this Adaptive Card JSON is embedded in the message body.")]
+    [string]$AdaptiveCardPayload = "",
+
+	[Parameter(Mandatory=$False,HelpMessage="If specified, message will be saved to Sent Items.")]
+	[Switch]$SaveToSentItems
+
 )
+
+function Set-DefaultMessageHtml
+{
+    param([string]$Content)
+
+    if ([String]::IsNullOrEmpty($script:MessageHTML))
+    {
+        $script:MessageHTML = $Content
+    }
+}
 
 
 $graphUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/"
@@ -75,7 +100,7 @@ Write-Host "Successfully obtained OAuth token" -ForegroundColor Green
 # Send message to the mailbox owner (i.e. send message to self)
 $createUrl = "$($graphUrl)sendMail"
 
-$attachmentJson = ""
+$attachmentList = @()
 if (-not [String]::IsNullOrEmpty($AttachPicture))
 {
     # Add attachment
@@ -107,61 +132,91 @@ if (-not [String]::IsNullOrEmpty($AttachPicture))
             $attachBytesBase64 = [Convert]::ToBase64String($pictureBytes)
 
             # Add the attachment JSON
-            $attachmentJson = ",
-    ""attachments"": [
-      {
-        ""@odata.type"": ""#microsoft.graph.fileAttachment"",
-        ""name"": ""$($pictureFile.Name)"",
-        ""contentId"": ""image001.png@01D82E0D.6377FC90"",
-        ""contentType"": ""image/$pictureType"",
-        ""contentBytes"": ""$attachBytesBase64""
-      }
-    ]
-"
-            if ([String]::IsNullOrEmpty($MessageHTML))
-            {
-                # If no message HTML has been provided, we add some that will embed the image in the message body
-                $MessageHTML = "<html><body><p>This is the image: <img id='Picture_x0020_1' src='cid:image001.png@01D82E0D.6377FC90'></p></body></html>"
+            $attachmentList += [pscustomobject]@{
+                '@odata.type' = '#microsoft.graph.fileAttachment'
+                name = $pictureFile.Name
+                contentId = 'image001.png@01D82E0D.6377FC90'
+                contentType = "image/$pictureType"
+                contentBytes = $attachBytesBase64
             }
+            # If no message HTML has been provided, embed the image in a simple body
+            Set-DefaultMessageHtml "<html><body><p>This is the image: <img id='Picture_x0020_1' src='cid:image001.png@01D82E0D.6377FC90'></p></body></html>"
         }
     }
 }
 
-if ([String]::IsNullOrEmpty($MessageHTML))
+if (-not [String]::IsNullOrEmpty($AdaptiveCardPayload))
 {
-    # No message HTML provided, so just use a text example
-    $bodyJson = """body"":{
-            ""contentType"":""Text"",
-            ""content"":""This is a test message sent using Graph sendMail.""
-        }"
-}
-else
-{
-    $bodyJson = """body"":{
-            ""contentType"":""HTML"",
-            ""content"":""$MessageHTML""
-        }"
+    try
+    {
+        $cardJsonObject = $AdaptiveCardPayload | ConvertFrom-Json
+    }
+    catch
+    {
+        Write-Host "Adaptive Card payload must be valid JSON." -ForegroundColor Red
+        exit
+    }
+
+    $cardJson = $cardJsonObject | ConvertTo-Json -Depth 20 -Compress
+    $adaptiveCardScript = "<script type='application/adaptivecard+json'>$cardJson</script>"
+
+    $originalMessageHtml = $MessageHTML
+    Set-DefaultMessageHtml "<html><head><meta http-equiv='Content-Type' content='text/html; charset=utf-8'></head><body><p>This message contains an Adaptive Card.</p>$adaptiveCardScript</body></html>"
+
+    if ($MessageHTML -eq $originalMessageHtml)
+    {
+        $bodyCloseRegex = [System.Text.RegularExpressions.Regex]::new("</body>", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($bodyCloseRegex.IsMatch($MessageHTML))
+        {
+            $MessageHTML = $bodyCloseRegex.Replace($MessageHTML, "$adaptiveCardScript</body>", 1)
+        }
+        else
+        {
+            $MessageHTML = "$MessageHTML$adaptiveCardScript"
+        }
+    }
 }
 
-$sendMessageJson = "
+$bodyContentType = "Text"
+$bodyContent = "This is a test message sent using Graph sendMail."
+
+if ($MessageHTML)
 {
-    ""message"": {
-        ""subject"":""Test Message"",
-        ""importance"":""Low"",
-        $bodyJson,
-        ""toRecipients"":[
-            {
-                ""emailAddress"":{
-                    ""address"":""$Mailbox""
+    $bodyContentType = "HTML"
+    $bodyContent = $MessageHTML
+}
+
+$targetRecipient = $Mailbox
+if ($Recipient)
+{
+    $targetRecipient = $Recipient
+}
+
+$messagePayload = @{
+    message = @{
+        subject = "Test Message"
+        importance = "Low"
+        body = @{
+            contentType = $bodyContentType
+            content = $bodyContent
+        }
+        toRecipients = @(
+            @{
+                emailAddress = @{
+                    address = $targetRecipient
                 }
             }
-        ]"
+        )
+    }
+    saveToSentItems = [bool]$SaveToSentItems
+}
 
-$sendMessageJson = "$sendMessageJson$attachmentJson"
+if ($attachmentList.Count -gt 0)
+{
+    $messagePayload.message.attachments = $attachmentList
+}
 
-$sendMessageJson = "$sendMessageJson},
-    ""saveToSentItems"": ""true""
-}"
+$sendMessageJson = $messagePayload | ConvertTo-Json -Depth 20
 
 $sendMessageJson
 
