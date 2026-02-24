@@ -14,13 +14,18 @@
 
 <#
 .SYNOPSIS
-Sample script demonstrating how to export messages from an Exchange Online mailbox to the file system or another Exchange Online mailbox using Microsoft Graph.
+Sample script demonstrating how to export/import messages to/from an Exchange Online mailbox using Microsoft Graph.
 
 .DESCRIPTION
-This script demonstrates how to use Microsoft Graph to export messages from a mailbox to the file system, or copy messages between mailboxes.
+This script demonstrates how to use Microsoft Graph to:
+1. Export messages from a mailbox to the file system
+2. Copy messages between mailboxes  
+3. Import messages from the file system to a mailbox
+
 https://learn.microsoft.com/en-us/graph/mailbox-import-export-concept-overview
 
 When exporting, messages are saved as JSON files with metadata (including original message ID, subject, received date/time, etc.) in a separate metadata file.
+When importing, the script scans all folders under the ImportPath and imports messages to the corresponding folders in the target mailbox.
 
 .EXAMPLE
 
@@ -29,6 +34,9 @@ When exporting, messages are saved as JSON files with metadata (including origin
 
 # Export messages from Inbox folder of a mailbox to the file system, including subfolders and creating folders in target if they do not exist
 .\ImportExport-Messages.ps1 -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -SourceMailbox $SourceMailbox -TargetMailbox $TargetMailbox -Folders @("Inbox") -CreateFolders -IncludeSubfolders -ExportPath "C:\temp\mbxexport"
+
+# Import messages from the file system to a target mailbox
+.\ImportExport-Messages.ps1 -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -TargetMailbox $TargetMailbox -ImportPath "C:\temp\mbxexport" -CreateFolders
 #>
 
 
@@ -69,11 +77,11 @@ param (
     [switch]$TraceGraphCalls,
 <# Graph.ps1 %PARAMS_END% #>
 
-    [Parameter(Mandatory=$True,HelpMessage="Source mailbox.")]
+    [Parameter(Mandatory=$False,HelpMessage="Source mailbox (required for export mode).")]
     [ValidateNotNullOrEmpty()]
     [string]$SourceMailbox = "",
 
-    [Parameter(Mandatory=$False,HelpMessage="Target mailbox (only required if importing items to another mailbox).")]
+    [Parameter(Mandatory=$False,HelpMessage="Target mailbox (required if importing items to another mailbox or from file system).")]
     [ValidateNotNullOrEmpty()]
     [string]$TargetMailbox = "",
 
@@ -89,13 +97,38 @@ param (
     [ValidateNotNullOrEmpty()]
     [string]$ExportPath = "",
 
-    [Parameter(Mandatory=$True,HelpMessage="Target mailbox (only required if importing items to another mailbox).")]
+    [Parameter(Mandatory=$False,HelpMessage="Import path (only required if importing items from the file system).")]
+    [ValidateNotNullOrEmpty()]
+    [string]$ImportPath = "",
+
+    [Parameter(Mandatory=$False,HelpMessage="Folders to process (required for export mode, ignored for import mode).")]
     [ValidateNotNullOrEmpty()]
     $Folders = @("Inbox")
 
 )
 
-$script:ScriptVersion = "1.0.0"
+$script:ScriptVersion = "1.0.1"
+$scriptStartTime = [DateTime]::Now
+
+# Parameter validation
+if (![String]::IsNullOrEmpty($ImportPath))
+{
+    # Import mode - require TargetMailbox
+    if ([String]::IsNullOrEmpty($TargetMailbox))
+    {
+        Write-Host "Error: TargetMailbox is required when ImportPath is specified" -ForegroundColor Red
+        exit
+    }
+}
+else
+{
+    # Export mode - require SourceMailbox
+    if ([String]::IsNullOrEmpty($SourceMailbox))
+    {
+        Write-Host "Error: SourceMailbox is required for export mode" -ForegroundColor Red
+        exit
+    }
+}
 
 <# Logging.ps1 %FUNCTIONS_START% #>
 if ($LogToFile) {
@@ -900,6 +933,53 @@ function SaveExportedItemToFiles($exportResult, $messageId, $folderPath, $subjec
     }
 }
 
+# Function to read exported item (metadata and data) from files
+function ReadExportedItemFromFiles($dataFilePath)
+{
+    try
+    {
+        # Check if the data file exists
+        if (-not (Test-Path -Path $dataFilePath))
+        {
+            Log "Data file not found: $dataFilePath" Red
+            return $null
+        }
+        
+        # Metadata file path (same name with .metadata.json extension)
+        $messageId = [System.IO.Path]::GetFileNameWithoutExtension($dataFilePath)
+        $directory = [System.IO.Path]::GetDirectoryName($dataFilePath)
+        $metadataFilePath = Join-Path -Path $directory -ChildPath "$messageId.metadata.json"
+        
+        # Read the data file
+        $exportData = [System.IO.File]::ReadAllText($dataFilePath)
+        LogVerbose "Read export data from: $dataFilePath"
+        
+        # Read metadata file (optional - for logging purposes)
+        $metadata = $null
+        if (Test-Path -Path $metadataFilePath)
+        {
+            $metadata = [System.IO.File]::ReadAllText($metadataFilePath)
+            LogVerbose "Read metadata from: $metadataFilePath"
+        }
+        else
+        {
+            LogVerbose "Metadata file not found: $metadataFilePath"
+        }
+        
+        # Return both metadata and export data
+        return @{
+            metadata = $metadata
+            exportData = $exportData
+            messageId = $messageId
+        }
+    }
+    catch
+    {
+        Log "Failed to read exported item from files: $($_.Exception.Message)" Red
+        return $null
+    }
+}
+
 # Function to import an item to a target mailbox
 function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
 {
@@ -1229,25 +1309,165 @@ function ProcessFolderAndSubfolders($folderPath)
     }
 }
 
+# Function to import all exported items from the file system
+function ImportFromFileSystem()
+{
+    if ([String]::IsNullOrEmpty($ImportPath))
+    {
+        Log "ImportPath not specified" Red
+        return
+    }
+    
+    if ([String]::IsNullOrEmpty($TargetMailbox))
+    {
+        Log "TargetMailbox must be specified when importing from file system" Red
+        return
+    }
+    
+    if (-not (Test-Path -Path $ImportPath))
+    {
+        Log "ImportPath does not exist: $ImportPath" Red
+        return
+    }
+    
+    Log "Importing messages from: $ImportPath to mailbox: $TargetMailbox"
+    
+    # Update graphBaseUrl to target mailbox
+    $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/"
+    
+    # Find all .json files (excluding .metadata.json files)
+    $dataFiles = Get-ChildItem -Path $ImportPath -Filter "*.json" -Recurse | Where-Object { $_.Name -notlike "*.metadata.json" }
+    
+    if ($dataFiles.Count -eq 0)
+    {
+        Log "No exported message files found in $ImportPath" Yellow
+        return
+    }
+    
+    Log "Found $($dataFiles.Count) message file(s) to import"
+    
+    # Group files by folder path
+    $folderGroups = @{}
+    foreach ($file in $dataFiles)
+    {
+        # Get the relative path from ImportPath
+        $relativePath = $file.DirectoryName.Substring($ImportPath.Length).TrimStart('\', '/')
+        
+        # Normalize path (use backslash as separator)
+        $folderPath = $relativePath -replace '/', '\'
+        
+        if ([String]::IsNullOrEmpty($folderPath))
+        {
+            Log "Skipping file at root level (no folder path): $($file.Name)" Yellow
+            continue
+        }
+        
+        if (-not $folderGroups.ContainsKey($folderPath))
+        {
+            $folderGroups[$folderPath] = @()
+        }
+        
+        $folderGroups[$folderPath] += $file
+    }
+    
+    Log "Messages organized into $($folderGroups.Count) folder(s)"
+    
+    # Process each folder
+    foreach ($folderPath in $folderGroups.Keys)
+    {
+        Log "Processing folder: $folderPath"
+        
+        # Find or create the target folder
+        $targetFolder = $null
+        if ($CreateFolders)
+        {
+            $targetFolder = FindOrCreateFolder $folderPath
+        }
+        else
+        {
+            $targetFolder = FindFolder $folderPath
+        }
+        
+        if (-not $targetFolder)
+        {
+            Log "Target folder '$folderPath' not found in mailbox $TargetMailbox, skipping $($folderGroups[$folderPath].Count) message(s)" Yellow
+            $script:statistics.ImportFailed += $folderGroups[$folderPath].Count
+            continue
+        }
+        
+        Log "Target folder '$folderPath' validated (ID: $($targetFolder.id))"
+        
+        # Import each message file in this folder
+        $importSuccessCount = 0
+        $importFailedCount = 0
+        
+        foreach ($file in $folderGroups[$folderPath])
+        {
+            LogVerbose "Importing file: $($file.FullName)"
+            
+            # Read the exported item from files
+            $exportedItem = ReadExportedItemFromFiles $file.FullName
+            
+            if (-not $exportedItem)
+            {
+                Log "Failed to read exported item from: $($file.FullName)" Red
+                $importFailedCount++
+                $script:statistics.ImportFailed++
+                continue
+            }
+            
+            # Extract subject and received date from metadata (if available)
+            $subject = "Unknown"
+            $receivedDateTime = "Unknown"
+            if ($exportedItem.metadata)
+            {
+                try
+                {
+                    $metadataObj = $exportedItem.metadata | ConvertFrom-Json
+                    if ($metadataObj.subject)
+                    {
+                        $subject = $metadataObj.subject
+                    }
+                    if ($metadataObj.receivedDateTime)
+                    {
+                        $receivedDateTime = $metadataObj.receivedDateTime
+                    }
+                }
+                catch
+                {
+                    LogVerbose "Failed to parse metadata: $($_.Exception.Message)"
+                }
+            }
+            
+            LogVerbose "Importing message: $subject (Received: $receivedDateTime)"
+            
+            # Import the item to the target mailbox
+            $imported = ImportItemToMailbox $TargetMailbox $targetFolder.id $exportedItem.exportData
+            
+            if ($imported)
+            {
+                $importSuccessCount++
+                $script:statistics.ImportSuccess++
+                Log "Imported: $($file.Name) (Subject: $subject)"
+            }
+            else
+            {
+                $importFailedCount++
+                $script:statistics.ImportFailed++
+                Log "Failed to import: $($file.Name) (Subject: $subject)" Red
+            }
+        }
+        
+        # Update folders processed count
+        $script:statistics.FoldersProcessed++
+        
+        Log "Complete for '$folderPath': Imports: $importSuccessCount succeeded, $importFailedCount failed" $(if ($importFailedCount -eq 0) { "Green" } else { "Yellow" })
+    }
+}
+
 ################
 # Main code
 ################
-
-# Update the base Graph URL to use the source mailbox
-if (![String]::IsNullOrEmpty($SourceMailbox))
-{
-    if ($SourceMailbox -eq "me" -and [String]::IsNullOrEmpty($AppSecretKey))
-    {
-        # Using delegate permissions with "me"
-        $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/me/"
-    }
-    else
-    {
-        # Using specific mailbox (email address or user ID)
-        $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/users/$SourceMailbox/"
-    }
-    Log "Using source mailbox: $SourceMailbox"
-}
 
 # Cache for folder paths and their IDs (per mailbox)
 $script:folderCaches = @{}
@@ -1263,10 +1483,39 @@ $script:statistics = @{
     FoldersProcessed = 0
 }
 
-# Process each folder specified in $Folders parameter
-foreach ($folderName in $Folders)
+# Check if we're importing from file system or exporting
+if (![String]::IsNullOrEmpty($ImportPath))
 {
-    ProcessFolderAndSubfolders $folderName
+    # Import mode - read from file system and import to target mailbox
+    Log "Operating in IMPORT mode (from file system)"
+    ImportFromFileSystem
+}
+else
+{
+    # Export mode - export from source mailbox
+    Log "Operating in EXPORT mode (from source mailbox)"
+    
+    # Update the base Graph URL to use the source mailbox
+    if (![String]::IsNullOrEmpty($SourceMailbox))
+    {
+        if ($SourceMailbox -eq "me" -and [String]::IsNullOrEmpty($AppSecretKey))
+        {
+            # Using delegate permissions with "me"
+            $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/me/"
+        }
+        else
+        {
+            # Using specific mailbox (email address or user ID)
+            $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/users/$SourceMailbox/"
+        }
+        Log "Using source mailbox: $SourceMailbox"
+    }
+    
+    # Process each folder specified in $Folders parameter
+    foreach ($folderName in $Folders)
+    {
+        ProcessFolderAndSubfolders $folderName
+    }
 }
 
 # Log final statistics
@@ -1308,3 +1557,5 @@ else
 {
     Log "Completed with $totalFailures total failure(s)" Yellow
 }
+
+Log "Script finished in $([DateTime]::Now.Subtract($scriptStartTime).ToString())" Green
