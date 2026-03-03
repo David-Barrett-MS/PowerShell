@@ -24,7 +24,7 @@ This script demonstrates how to use Microsoft Graph to:
 
 https://learn.microsoft.com/en-us/graph/mailbox-import-export-concept-overview
 
-When exporting, messages are saved as JSON files with metadata (including original message ID, subject, received date/time, etc.) in a separate metadata file.
+When exporting, messages are saved as JSON files with metadata (including original message ID, received date/time, etc.) in a separate metadata file.
 When importing, the script scans all folders under the ImportPath and imports messages to the corresponding folders in the target mailbox.
 
 .EXAMPLE
@@ -107,7 +107,7 @@ param (
 
 )
 
-$script:ScriptVersion = "1.0.1"
+$script:ScriptVersion = "1.0.2"
 $scriptStartTime = [DateTime]::Now
 
 # Parameter validation
@@ -310,6 +310,7 @@ function TraceInvokeRestMethod($method, $url, $body)
             $invokeParameters.Headers.GetEnumerator() | Where-Object { $_.Key -ne "Authorization" } | ForEach-Object {
                 "$($_.Key): $($_.Value)" | out-file $script:traceFile -Append
             }
+            "Date: $([datetime]::UtcNow.ToString('r'))" | out-file $script:traceFile -Append
         }
 
         if ($method -eq "POST" -or $method -eq "PATCH")
@@ -379,7 +380,8 @@ function TraceInvokeRestMethod($method, $url, $body)
         Log "$method failed to URL: $url" Red
         if ($Error[0].ErrorDetails.Message)
         {
-            $errResponse = $Error[0].ErrorDetails.Message | ConvertFrom-Json
+            $errResponse = $null
+            $errResponse = $Error[0].ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue
             if ($errResponse)
             {
                 if ($errResponse.error.details.message)
@@ -478,43 +480,32 @@ $script:wellKnownFolderNames = @(
     "syncissues"
 )
 
-# Helper function to get the folder cache for the current mailbox
-function GetCurrentFolderCache()
+# Helper function to get the folder cache for the specified mailbox
+function GetCurrentFolderCache($Mailbox)
 {
-    # Extract mailbox identifier from current graphBaseUrl
-    # Format: https://graph.microsoft.com/v1.0/users/{mailbox}/
-    #      or https://graph.microsoft.com/v1.0/me/
-    $mailboxKey = "unknown"
-    
-    if ($script:graphBaseUrl -match 'users/([^/]+)/')
-    {
-        $mailboxKey = $matches[1]
-    }
-    elseif ($script:graphBaseUrl -match '/me/')
-    {
-        $mailboxKey = "me"
-    }
-    
     # Get or create cache for this mailbox
-    if (-not $script:folderCaches.ContainsKey($mailboxKey))
+    if (-not $script:folderCaches.ContainsKey($Mailbox))
     {
-        $script:folderCaches[$mailboxKey] = @{}
-        LogVerbose "Created new folder cache for mailbox: $mailboxKey"
+        $script:folderCaches[$Mailbox] = @{}
+        LogVerbose "Created new folder cache for mailbox: $Mailbox"
     }
     
-    return $script:folderCaches[$mailboxKey]
+    return $script:folderCaches[$Mailbox]
 }
 
 # Function to find a folder by path (e.g., "\inbox\subfolder1")
-function FindFolder($folderPath)
+function FindFolder($folderPath, $Mailbox)
 {
-    LogVerbose "Searching for folder path: $folderPath"
+    LogVerbose "Searching for folder path: $folderPath in mailbox: $Mailbox"
     
     # Normalize the path (remove leading/trailing backslashes, convert to lowercase)
     $folderPath = $folderPath.Trim('\').ToLower()
     
-    # Get the cache for the current mailbox
-    $cache = GetCurrentFolderCache
+    # Build the base URL for this mailbox
+    $mailboxBaseUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/"
+    
+    # Get the cache for the specified mailbox
+    $cache = GetCurrentFolderCache $Mailbox
     
     # Check cache first
     if ($cache.ContainsKey($folderPath))
@@ -558,7 +549,7 @@ function FindFolder($folderPath)
             if ($script:wellKnownFolderNames -contains $folderName)
             {
                 LogVerbose "Accessing well-known folder: $folderName"
-                $url = "$($script:graphBaseUrl)mailFolders/$folderName"
+                $url = "$($mailboxBaseUrl)mailFolders/$folderName"
                 $result = GET $url
                 
                 if ($result)
@@ -584,7 +575,7 @@ function FindFolder($folderPath)
         {
             # This is a subfolder - search for it under the current parent folder
             LogVerbose "Searching for subfolder '$folderName' under parent folder ID: $currentFolderId"
-            $url = "$($script:graphBaseUrl)mailFolders/$currentFolderId/childFolders?`$filter=displayName eq '$folderName'"
+            $url = "$($mailboxBaseUrl)mailFolders/$currentFolderId/childFolders?`$filter=displayName eq '$folderName'"
             $result = GET $url
             
             if ($result)
@@ -628,9 +619,12 @@ function FindFolder($folderPath)
 }
 
 # Function to create a folder
-function CreateFolder($parentFolderId, $folderName)
+function CreateFolder($parentFolderId, $folderName, $Mailbox)
 {
-    LogVerbose "Creating folder '$folderName' under parent folder ID: $parentFolderId"
+    LogVerbose "Creating folder '$folderName' under parent folder ID: $parentFolderId in mailbox: $Mailbox"
+    
+    # Build the base URL for this mailbox
+    $mailboxBaseUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/"
     
     # Build the request body
     $folderRequest = @{
@@ -638,7 +632,7 @@ function CreateFolder($parentFolderId, $folderName)
     } | ConvertTo-Json
     
     # Create the folder
-    $url = "$($script:graphBaseUrl)mailFolders/$parentFolderId/childFolders"
+    $url = "$($mailboxBaseUrl)mailFolders/$parentFolderId/childFolders"
     $result = POST $url $folderRequest
     
     if ($result)
@@ -655,9 +649,9 @@ function CreateFolder($parentFolderId, $folderName)
 }
 
 # Function to find or create a folder by path
-function FindOrCreateFolder($folderPath)
+function FindOrCreateFolder($folderPath, $Mailbox)
 {
-    LogVerbose "Finding or creating folder path: $folderPath"
+    LogVerbose "Finding or creating folder path: $folderPath in mailbox: $Mailbox"
     
     # Keep the original path for folder creation (preserves case)
     $originalPath = $folderPath.Trim('\\')
@@ -665,8 +659,11 @@ function FindOrCreateFolder($folderPath)
     # Normalize the path for cache lookups (lowercase)
     $normalizedPath = $originalPath.ToLower()
     
-    # Get the cache for the current mailbox
-    $cache = GetCurrentFolderCache
+    # Build the base URL for this mailbox
+    $mailboxBaseUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/"
+    
+    # Get the cache for the specified mailbox
+    $cache = GetCurrentFolderCache $Mailbox
     
     # Check cache first (using normalized path)
     if ($cache.ContainsKey($normalizedPath))
@@ -715,7 +712,7 @@ function FindOrCreateFolder($folderPath)
             if ($script:wellKnownFolderNames -contains $folderName)
             {
                 LogVerbose "Accessing well-known folder: $folderName"
-                $url = "$($script:graphBaseUrl)mailFolders/$folderName"
+                $url = "$($mailboxBaseUrl)mailFolders/$folderName"
                 $result = GET $url
                 
                 if ($result)
@@ -741,7 +738,7 @@ function FindOrCreateFolder($folderPath)
         {
             # This is a subfolder - search for it under the current parent folder
             LogVerbose "Searching for subfolder '$folderName' under parent folder ID: $currentFolderId"
-            $url = "$($script:graphBaseUrl)mailFolders/$currentFolderId/childFolders?`$filter=displayName eq '$folderName'"
+            $url = "$($mailboxBaseUrl)mailFolders/$currentFolderId/childFolders?`$filter=displayName eq '$folderName'"
             $result = GET $url
             
             if ($result)
@@ -764,7 +761,7 @@ function FindOrCreateFolder($folderPath)
                     # Subfolder not found, create it if CreateFolders is set
                     if ($CreateFolders)
                     {
-                        $folder = CreateFolder $currentFolderId $originalFolderName
+                        $folder = CreateFolder $currentFolderId $originalFolderName $Mailbox
                         if ($folder)
                         {
                             $currentFolderId = $folder.id
@@ -810,7 +807,6 @@ function ListItemsForExport($folderId, $folderName)
     $items = @()
     # Use the correct mailbox export API endpoint
     # GET /admin/exchange/mailboxes/{mailboxId}/folders/{mailboxFolderId}/items
-    # Only request the minimum required fields: id, receivedDateTime, and subject
     $url = "https://graph.microsoft.com/beta/admin/exchange/mailboxes/$SourceMailbox/folders/$folderId/items"
     
     do
@@ -882,7 +878,7 @@ function ExportItem($folderId, $itemId)
 }
 
 # Function to save exported item (metadata and data) to files
-function SaveExportedItemToFiles($exportResult, $messageId, $folderPath, $subject, $receivedDateTime)
+function SaveExportedItemToFiles($exportResult, $messageId, $folderPath, $receivedDateTime)
 {
     if ([String]::IsNullOrEmpty($ExportPath))
     {
@@ -923,7 +919,7 @@ function SaveExportedItemToFiles($exportResult, $messageId, $folderPath, $subjec
         [System.IO.File]::WriteAllText($dataFilePath, $exportResult.exportData)
         LogVerbose "Saved data to: $dataFilePath"
         
-        Log "Saved item files: $messageId.metadata.json and $messageId.json (Subject: $subject, Received: $receivedDateTime)"
+        Log "Saved item files: $messageId.metadata.json and $messageId.json (Received: $receivedDateTime)"
         return $true
     }
     catch
@@ -985,6 +981,12 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
 {
     LogVerbose "Importing item to mailbox: $targetMailbox, folder: $folderId"
     
+    # Initialize result object
+    $result = @{
+        Success = $false
+        DataSize = 0
+    }
+    
     # Step 1: Create an import session to get the upload URL
     # POST /admin/exchange/mailboxes/{mailboxId}/createImportSession
     $createSessionUrl = "https://graph.microsoft.com/beta/admin/exchange/mailboxes/$targetMailbox/createImportSession"
@@ -996,13 +998,24 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
             folderId = $folderId
         } | ConvertTo-Json -Depth 10
         
-        LogVerbose "Creating import session for folder: $folderId"
-        $sessionResult = POST $createSessionUrl $sessionRequest
+        $importSessionAttempts = 0
+        $sessionResult = $null
+
+        while ($importSessionAttempts -lt 3 -and !$sessionResult)
+        {
+            LogVerbose "Creating import session for folder: $folderId"        
+            $sessionResult = POST $createSessionUrl $sessionRequest
+            if (!$sessionResult)
+            {
+                LogVerbose "Failed to create import session on attempt $($importSessionAttempts + 1)"
+                $importSessionAttempts++
+            }
+        }
         
         if (!$sessionResult)
         {
             Log "Failed to create import session" Red
-            return $false
+            return $result
         }
         
         # Parse the session response to get the import URL
@@ -1012,7 +1025,7 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
         if ([String]::IsNullOrEmpty($uploadUrl))
         {
             Log "No import URL returned from import session" Red
-            return $false
+            return $result
         }
         
         LogVerbose "Import session created, import URL: $uploadUrl"
@@ -1036,8 +1049,11 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
             if ([String]::IsNullOrEmpty($messageData))
             {
                 Log "No message data found in export response" Red
-                return $false
+                return $result
             }
+            
+            # Store the data size for statistics
+            $result.DataSize = $messageData.Length
             
             LogVerbose "Extracted message data (length: $($messageData.Length) characters)"
             
@@ -1051,7 +1067,7 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
         else
         {
             Log "Export data does not contain expected 'value' array" Red
-            return $false
+            return $result
         }
         
         # The import URL is pre-authenticated (token in URL), so we should not include auth headers
@@ -1067,33 +1083,231 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
             Body = $importBody
             ContentType = "application/json"
         }
+               
+        $maxRetries = 5
+        $retryCount = 0
+        $uploadSuccess = $false
+        $uploadResult = $null
         
-        if ($PSVersionTable.PSVersion -ge [version]7.4)
+        while ($retryCount -le $maxRetries -and !$uploadSuccess)
         {
-            $invokeParameters.ConnectionTimeoutSeconds = $ConnectionTimeout
+            try
+            {
+                # Trace web request (but not the payload)
+                if ($TraceGraphCalls)
+                {
+                    if ($retryCount -gt 0)
+                    {
+                        "Retry attempt $retryCount of $maxRetries" | out-file $script:traceFile -Append
+                    }
+                    Add-Content -Path $script:traceFile -Value "POST $uploadUrl"
+                    $uploadHeaders.GetEnumerator() | Where-Object { $_.Key -ne "Authorization" } | ForEach-Object {
+                        "$($_.Key): $($_.Value)" | out-file $script:traceFile -Append
+                    }
+                    "Date: $([datetime]::UtcNow.ToString('r'))" | out-file $script:traceFile -Append
+                    "(Request body omitted - message data payload)" | out-file $script:traceFile -Append
+                }
+                
+                $uploadResult = Invoke-WebRequest @invokeParameters -ErrorAction Stop
+                
+                # Trace web response
+                if ($TraceGraphCalls)
+                {
+                    "" | out-file $script:traceFile -Append
+                    "HTTP $($uploadResult.StatusCode) $($uploadResult.StatusDescription)" | out-file $script:traceFile -Append
+                    $uploadResult.Headers.GetEnumerator() | ForEach-Object {
+                        "$($_.Key): $($_.Value)" | out-file $script:traceFile -Append
+                    }
+                    "" | out-file $script:traceFile -Append
+                    $uploadResult.Content | out-file $script:traceFile -Append
+                    "`r`n" | out-file $script:traceFile -Append
+                }
+                
+                $uploadSuccess = $true
+            }
+            catch
+            {
+                $statusCode = 0
+                $retryAfter = 0
+                $rateLimitReason = ""
+                $shouldRetry = $false
+                
+                # Extract status code and check if it's a throttling error
+                if ($_.Exception.Response)
+                {
+                    try
+                    {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                        $statusDescription = $_.Exception.Response.StatusDescription
+                        if ([string]::IsNullOrEmpty($statusDescription))
+                        {
+                            $statusDescription = $_.Exception.Response.ReasonPhrase
+                        }
+                        
+                        # Log HTTP error status to trace file
+                        if ($TraceGraphCalls)
+                        {
+                            "" | out-file $script:traceFile -Append
+                            "HTTP $statusCode $statusDescription" | out-file $script:traceFile -Append
+                        }
+                        
+                        # Parse response headers (single loop for both extraction and logging)
+                        $headers = $_.Exception.Response.Headers
+                        if ($headers)
+                        {
+                            $rateLimitExceeded = ""
+                            foreach ($header in $headers)
+                            {
+                                # Log header if tracing
+                                if ($TraceGraphCalls)
+                                {
+                                    "$($header.Key): $($header.Value -join ', ')" | out-file $script:traceFile -Append
+                                }
+                                
+                                # Extract throttling-related headers
+                                if ($statusCode -eq 429)
+                                {
+                                    if ($header.Key -eq 'Retry-After')
+                                    {
+                                        $retryAfter = [int]($header.Value -join '')
+                                    }
+                                    elseif ($header.Key -eq 'Rate-Limit-Reason')
+                                    {
+                                        $rateLimitReason = $header.Value -join ''
+                                    }
+                                    elseif ($header.Key -eq 'RateLimit-Exceeded')
+                                    {
+                                        $rateLimitExceeded = $header.Value -join ''
+                                    }
+                                }
+                            }
+                            $rateLimitReason = "$rateLimitExceeded $rateLimitReason".Trim()
+
+                        }
+                        
+                        # Set retry flag for throttling errors
+                        if ($statusCode -eq 429)
+                        {
+                            $shouldRetry = $true
+                        }
+                        
+                        # Log response body/payload
+                        if ($TraceGraphCalls)
+                        {
+                            "" | out-file $script:traceFile -Append
+                            if ($_.ErrorDetails.Message)
+                            {
+                                $_.ErrorDetails.Message | out-file $script:traceFile -Append
+                            }
+                            else
+                            {
+                                "(No error response payload)" | out-file $script:traceFile -Append
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        if ($TraceGraphCalls)
+                        {
+                            "Unable to retrieve error response details: $($_.Exception.Message)" | out-file $script:traceFile -Append
+                        }
+                    }
+                }
+                else
+                {
+                    if ($TraceGraphCalls)
+                    {
+                        "" | out-file $script:traceFile -Append
+                        "HTTP ERROR (no response object available)" | out-file $script:traceFile -Append
+                        "" | out-file $script:traceFile -Append
+                        if ($_.ErrorDetails.Message)
+                        {
+                            $_.ErrorDetails.Message | out-file $script:traceFile -Append
+                        }
+                        else
+                        {
+                            "(No error response payload)" | out-file $script:traceFile -Append
+                        }
+                    }
+                }
+                
+                # Handle retry logic
+                if ($shouldRetry -and $retryCount -lt $maxRetries)
+                {
+                    $retryCount++
+                    if ($retryAfter -gt 0)
+                    {
+                        Log "Throttled 429 $rateLimitReason. Waiting $retryAfter seconds before retry $retryCount of $maxRetries..." Yellow
+                        if ($TraceGraphCalls)
+                        {
+                            "Waiting $retryAfter seconds before retry..." | out-file $script:traceFile -Append
+                            "`r`n" | out-file $script:traceFile -Append
+                        }
+                        Start-Sleep -Seconds $retryAfter
+                    }
+                    else
+                    {
+                        # Default wait if no Retry-After header
+                        $defaultWait = 30
+                        Log "Throttled 429 $rateLimitReason. No Retry-After header, waiting $defaultWait seconds before retry $retryCount of $maxRetries..." Yellow
+                        if ($TraceGraphCalls)
+                        {
+                            "No Retry-After header, waiting $defaultWait seconds before retry..." | out-file $script:traceFile -Append
+                            "`r`n" | out-file $script:traceFile -Append
+                        }
+                        Start-Sleep -Seconds $defaultWait
+                    }
+                }
+                else
+                {
+                    # No retry, or max retries exceeded
+                    if ($TraceGraphCalls)
+                    {
+                        "`r`n" | out-file $script:traceFile -Append
+                    }
+                    
+                    if ($statusCode -eq 429)
+                    {
+                        Log "Failed to import item after $retryCount retries (throttling): $($_.Exception.Message)" Red
+                    }
+                    else
+                    {
+                        Log "Failed to import item: $($_.Exception.Message)" Red
+                    }
+                    
+                    if ($_.ErrorDetails.Message)
+                    {
+                        LogVerbose "Error response: $($_.ErrorDetails.Message)"
+                    }
+                    return $result
+                }
+            }
         }
         
-        $uploadResult = Invoke-WebRequest @invokeParameters -ErrorAction Stop
-        
-        if ($uploadResult.StatusCode -eq 200 -or $uploadResult.StatusCode -eq 201)
+        if ($uploadSuccess -and ($uploadResult.StatusCode -eq 200 -or $uploadResult.StatusCode -eq 201))
         {
             Log "Successfully imported item to mailbox $targetMailbox"
-            return $true
+            $result.Success = $true
+            return $result
         }
         else
         {
-            Log "Failed to upload data to import session (Status: $($uploadResult.StatusCode))" Red
-            return $false
+            Log "Failed to upload data to import session after retries" Red
+            return $result
         }
     }
     catch
     {
-        Log "Failed to import item: $($_.Exception.Message)" Red
-        if ($_.ErrorDetails.Message)
+        # Catch any unexpected errors not related to the web request
+        Log "Unexpected error during import: $($_.Exception.Message)" Red
+        if ($TraceGraphCalls)
         {
-            LogVerbose "Error response: $($_.ErrorDetails.Message)"
+            "" | out-file $script:traceFile -Append
+            "UNEXPECTED ERROR: $($_.Exception.Message)" | out-file $script:traceFile -Append
+            $_ | out-file $script:traceFile -Append
+            "`r`n" | out-file $script:traceFile -Append
         }
-        return $false
+        return $result
     }
 }
 
@@ -1147,12 +1361,12 @@ function GetChildFolders($folderId, $folderPath)
     return $childFolders
 }
 
-# Function to process a folder and optionally its subfolders
+# Function to process a  folder and optionally its subfolders
 function ProcessFolderAndSubfolders($folderPath)
 {
     Log "Processing folder: $folderPath"
     
-    $folder = FindFolder $folderPath
+    $folder = FindFolder $folderPath $SourceMailbox
     if (!$folder)
     {
         Log "Skipping folder '$folderPath' - not found" Yellow
@@ -1172,23 +1386,15 @@ function ProcessFolderAndSubfolders($folderPath)
         {
             LogVerbose "Validating target folder in mailbox: $TargetMailbox"
             
-            # Temporarily update graphBaseUrl to target mailbox
-            # (GetCurrentFolderCache will automatically use the target mailbox cache)
-            $savedGraphBaseUrl = $script:graphBaseUrl
-            $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/"
-            
             # Use FindOrCreateFolder if CreateFolders is set, otherwise use FindFolder
             if ($CreateFolders)
             {
-                $targetFolder = FindOrCreateFolder $folderPath
+                $targetFolder = FindOrCreateFolder $folderPath $TargetMailbox
             }
             else
             {
-                $targetFolder = FindFolder $folderPath
+                $targetFolder = FindFolder $folderPath $TargetMailbox
             }
-            
-            # Restore original graphBaseUrl
-            $script:graphBaseUrl = $savedGraphBaseUrl
             
             if ($targetFolder)
             {
@@ -1210,7 +1416,7 @@ function ProcessFolderAndSubfolders($folderPath)
         
         foreach ($message in $messages)
         {
-            LogVerbose "Processing message: $($message.subject) (Received: $($message.receivedDateTime))"
+            LogVerbose "Processing message: (Received: $($message.receivedDateTime))"
             
             # Export the message content (two-stage process: metadata + data)
             $exportResult = ExportItem $folder.id $message.id
@@ -1223,7 +1429,7 @@ function ProcessFolderAndSubfolders($folderPath)
                 # Save to file system if ExportPath is specified
                 if (![String]::IsNullOrEmpty($ExportPath))
                 {
-                    $saved = SaveExportedItemToFiles $exportResult $message.id $folderPath $message.subject $message.receivedDateTime
+                    $saved = SaveExportedItemToFiles $exportResult $message.id $folderPath $message.receivedDateTime
                     if ($saved)
                     {
                         $saveSuccessCount++
@@ -1239,8 +1445,8 @@ function ProcessFolderAndSubfolders($folderPath)
                 # Import to target mailbox if folder validation succeeded
                 if ($targetFolder)
                 {
-                    $imported = ImportItemToMailbox $TargetMailbox $targetFolder.id $exportResult.exportData
-                    if ($imported)
+                    $importResult = ImportItemToMailbox $TargetMailbox $targetFolder.id $exportResult.exportData
+                    if ($importResult.Success)
                     {
                         $importSuccessCount++
                         $script:statistics.ImportSuccess++
@@ -1258,7 +1464,7 @@ function ProcessFolderAndSubfolders($folderPath)
             {
                 $exportFailedCount++
                 $script:statistics.ExportFailed++
-                Log "Failed to export message $($message.id): $($message.subject)" Red
+                Log "Failed to export message $($message.id)" Red
             }
         }
         
@@ -1332,8 +1538,10 @@ function ImportFromFileSystem()
     
     Log "Importing messages from: $ImportPath to mailbox: $TargetMailbox"
     
-    # Update graphBaseUrl to target mailbox
-    $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/users/$TargetMailbox/"
+    # Start timing for import statistics
+    $importStartTime = Get-Date
+    $totalBytesImported = 0
+    $successfulImports = 0
     
     # Find all .json files (excluding .metadata.json files)
     $dataFiles = Get-ChildItem -Path $ImportPath -Filter "*.json" -Recurse | Where-Object { $_.Name -notlike "*.metadata.json" }
@@ -1381,11 +1589,11 @@ function ImportFromFileSystem()
         $targetFolder = $null
         if ($CreateFolders)
         {
-            $targetFolder = FindOrCreateFolder $folderPath
+            $targetFolder = FindOrCreateFolder $folderPath $TargetMailbox
         }
         else
         {
-            $targetFolder = FindFolder $folderPath
+            $targetFolder = FindFolder $folderPath $TargetMailbox
         }
         
         if (-not $targetFolder)
@@ -1416,18 +1624,13 @@ function ImportFromFileSystem()
                 continue
             }
             
-            # Extract subject and received date from metadata (if available)
-            $subject = "Unknown"
+            # Extract received date from metadata (if available)
             $receivedDateTime = "Unknown"
             if ($exportedItem.metadata)
             {
                 try
                 {
                     $metadataObj = $exportedItem.metadata | ConvertFrom-Json
-                    if ($metadataObj.subject)
-                    {
-                        $subject = $metadataObj.subject
-                    }
                     if ($metadataObj.receivedDateTime)
                     {
                         $receivedDateTime = $metadataObj.receivedDateTime
@@ -1439,22 +1642,34 @@ function ImportFromFileSystem()
                 }
             }
             
-            LogVerbose "Importing message: $subject (Received: $receivedDateTime)"
+            LogVerbose "Importing message: (Received: $receivedDateTime)"
             
             # Import the item to the target mailbox
-            $imported = ImportItemToMailbox $TargetMailbox $targetFolder.id $exportedItem.exportData
+            $importResult = ImportItemToMailbox $TargetMailbox $targetFolder.id $exportedItem.exportData
             
-            if ($imported)
+            if ($importResult.Success)
             {
                 $importSuccessCount++
                 $script:statistics.ImportSuccess++
-                Log "Imported: $($file.Name) (Subject: $subject)"
+                $totalBytesImported += $importResult.DataSize
+                $successfulImports++
+                
+                # Format size for display using PowerShell numeric literals
+                $sizeDisplay = switch ($importResult.DataSize)
+                {
+                    {$_ -ge 1GB} { "{0:N2} GB" -f ($_ / 1GB); break }
+                    {$_ -ge 1MB} { "{0:N2} MB" -f ($_ / 1MB); break }
+                    {$_ -ge 1KB} { "{0:N2} KB" -f ($_ / 1KB); break }
+                    default      { "{0:N0} bytes" -f $_ }
+                }
+                
+                Log "Imported: $($file.Name) ($sizeDisplay)"
             }
             else
             {
                 $importFailedCount++
                 $script:statistics.ImportFailed++
-                Log "Failed to import: $($file.Name) (Subject: $subject)" Red
+                Log "Failed to import: $($file.Name)" Red
             }
         }
         
@@ -1463,6 +1678,33 @@ function ImportFromFileSystem()
         
         Log "Complete for '$folderPath': Imports: $importSuccessCount succeeded, $importFailedCount failed" $(if ($importFailedCount -eq 0) { "Green" } else { "Yellow" })
     }
+    
+    # Calculate and display import statistics
+    $importEndTime = Get-Date
+    $importDuration = ($importEndTime - $importStartTime).TotalSeconds
+    
+    Log "" 
+    Log "=== Import Statistics ===" Cyan
+    Log "Total items imported: $successfulImports" Cyan
+    Log "Total items failed: $($script:statistics.ImportFailed)" Cyan
+    
+    if ($successfulImports -gt 0)
+    {
+        $totalMB = $totalBytesImported / 1MB
+        $averageBytes = $totalBytesImported / $successfulImports
+        $averageKB = $averageBytes / 1KB
+        
+        Log "Total data imported: $($totalMB.ToString('N2')) MB ($totalBytesImported bytes)" Cyan
+        Log "Average message size: $($averageKB.ToString('N2')) KB ($([int]$averageBytes) bytes)" Cyan
+        
+        if ($importDuration -gt 0)
+        {
+            $mbPerSecond = $totalMB / $importDuration
+            Log "Import duration: $($importDuration.ToString('N2')) seconds" Cyan
+            Log "Import speed: $($mbPerSecond.ToString('N2')) MB/s" Cyan
+        }
+    }
+    Log "========================" Cyan
 }
 
 ################
