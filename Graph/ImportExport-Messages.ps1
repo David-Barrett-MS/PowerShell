@@ -27,6 +27,8 @@ https://learn.microsoft.com/en-us/graph/mailbox-import-export-concept-overview
 When exporting, messages are saved as JSON files with metadata (including original message ID, received date/time, etc.) in a separate metadata file.
 When importing, the script scans all folders under the ImportPath and imports messages to the corresponding folders in the target mailbox.
 
+See https://github.com/David-Barrett-MS/PowerShell/wiki/ImportExport%E2%80%90Messages.ps1 for details and usage instructions.
+
 .EXAMPLE
 
 # Export messages from Inbox and Sent Items folders of a mailbox to the file system
@@ -86,11 +88,9 @@ param (
     [string]$TargetMailbox = "",
 
     [Parameter(Mandatory=$False,HelpMessage="If specified, folders will be created in the target mailbox if they do not exist.")]
-    [ValidateNotNullOrEmpty()]
     [switch]$CreateFolders,
 
     [Parameter(Mandatory=$False,HelpMessage="If specified, subfolders will be included.")]
-    [ValidateNotNullOrEmpty()]
     [switch]$IncludeSubfolders,
 
     [Parameter(Mandatory=$False,HelpMessage="Export path (only required if exporting items to the file system).")]
@@ -103,11 +103,29 @@ param (
 
     [Parameter(Mandatory=$False,HelpMessage="Folders to process (required for export mode, ignored for import mode).")]
     [ValidateNotNullOrEmpty()]
-    $Folders = @("Inbox")
+    $Folders = @("Inbox"),
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, only items that were created before the specified date will be processed (useful for archiving)")]
+    [DateTime]$OnlyItemsCreatedBefore,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, only items that were sent or received before the specified date will be processed (useful for archiving).")]
+    [DateTime]$OnlyItemsSentReceivedBefore,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, only items that were created before the specified date will be processed (useful for archiving)")]
+    [DateTime]$OnlyItemsCreatedAfter,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, only items that were sent or received after the specified date will be processed (useful for archiving).")]
+    [DateTime]$OnlyItemsSentReceivedAfter,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, only items that were modified before the specified date will be processed.")]
+    [DateTime]$OnlyItemsModifiedBefore,
+
+    [Parameter(Mandatory=$False,HelpMessage="If specified, only items that were modified after the specified date will be processed.")]
+    [DateTime]$OnlyItemsModifiedAfter    
 
 )
 
-$script:ScriptVersion = "1.0.2"
+$script:ScriptVersion = "1.0.3"
 $scriptStartTime = [DateTime]::Now
 
 # Parameter validation
@@ -799,6 +817,155 @@ function FindOrCreateFolder($folderPath, $Mailbox)
     return $null
 }
 
+# Function to generate OData filter for date-based filtering during export
+function Get-DateFilterForExport()
+{
+    $filters = @()
+    
+    # Created date filters
+    if ($script:OnlyItemsCreatedBefore)
+    {
+        $dateString = $script:OnlyItemsCreatedBefore.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $filters += "createdDateTime lt $dateString"
+        LogVerbose "Added filter: createdDateTime lt $dateString"
+    }
+    
+    if ($script:OnlyItemsCreatedAfter)
+    {
+        $dateString = $script:OnlyItemsCreatedAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $filters += "createdDateTime gt $dateString"
+        LogVerbose "Added filter: createdDateTime gt $dateString"
+    }
+    
+    # Sent/Received date filters
+    if ($script:OnlyItemsSentReceivedBefore)
+    {
+        $dateString = $script:OnlyItemsSentReceivedBefore.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $filters += "receivedDateTime lt $dateString"
+        LogVerbose "Added filter: receivedDateTime lt $dateString"
+    }
+    
+    if ($script:OnlyItemsSentReceivedAfter)
+    {
+        $dateString = $script:OnlyItemsSentReceivedAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $filters += "receivedDateTime gt $dateString"
+        LogVerbose "Added filter: receivedDateTime gt $dateString"
+    }
+    
+    # Modified date filters
+    if ($script:OnlyItemsModifiedBefore)
+    {
+        $dateString = $script:OnlyItemsModifiedBefore.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $filters += "lastModifiedDateTime lt $dateString"
+        LogVerbose "Added filter: lastModifiedDateTime lt $dateString"
+    }
+    
+    if ($script:OnlyItemsModifiedAfter)
+    {
+        $dateString = $script:OnlyItemsModifiedAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $filters += "lastModifiedDateTime gt $dateString"
+        LogVerbose "Added filter: lastModifiedDateTime gt $dateString"
+    }
+    
+    # Combine filters with 'and'
+    if ($filters.Count -gt 0)
+    {
+        $filterString = $filters -join ' and '
+        LogVerbose "Generated OData filter: $filterString"
+        return $filterString
+    }
+    
+    return $null
+}
+
+# Function to test if an item's date metadata is within the specified range
+function Test-ItemDateWithinRange($metadata)
+{
+    # If no metadata is provided, default is to process the item
+    if (!$metadata)
+    {
+        LogVerbose "No metadata available for date validation, defaulting to process item"
+        return $true
+    }
+    
+    try
+    {
+        $metadataObj = $metadata | ConvertFrom-Json
+        
+        # Check created date filters
+        if ($script:OnlyItemsCreatedBefore -and $metadataObj.createdDateTime)
+        {
+            $createdDate = [DateTime]::Parse($metadataObj.createdDateTime)
+            if ($createdDate -ge $script:OnlyItemsCreatedBefore)
+            {
+                LogVerbose "Item created date ($createdDate) is not before $($script:OnlyItemsCreatedBefore), skipping"
+                return $false
+            }
+        }
+        
+        if ($script:OnlyItemsCreatedAfter -and $metadataObj.createdDateTime)
+        {
+            $createdDate = [DateTime]::Parse($metadataObj.createdDateTime)
+            if ($createdDate -le $script:OnlyItemsCreatedAfter)
+            {
+                LogVerbose "Item created date ($createdDate) is not after $($script:OnlyItemsCreatedAfter), skipping"
+                return $false
+            }
+        }
+        
+        # Check sent/received date filters
+        if ($script:OnlyItemsSentReceivedBefore -and $metadataObj.receivedDateTime)
+        {
+            $receivedDate = [DateTime]::Parse($metadataObj.receivedDateTime)
+            if ($receivedDate -ge $script:OnlyItemsSentReceivedBefore)
+            {
+                LogVerbose "Item received date ($receivedDate) is not before $($script:OnlyItemsSentReceivedBefore), skipping"
+                return $false
+            }
+        }
+        
+        if ($script:OnlyItemsSentReceivedAfter -and $metadataObj.receivedDateTime)
+        {
+            $receivedDate = [DateTime]::Parse($metadataObj.receivedDateTime)
+            if ($receivedDate -le $script:OnlyItemsSentReceivedAfter)
+            {
+                LogVerbose "Item received date ($receivedDate) is not after $($script:OnlyItemsSentReceivedAfter), skipping"
+                return $false
+            }
+        }
+        
+        # Check modified date filters
+        if ($script:OnlyItemsModifiedBefore -and $metadataObj.lastModifiedDateTime)
+        {
+            $modifiedDate = [DateTime]::Parse($metadataObj.lastModifiedDateTime)
+            if ($modifiedDate -ge $script:OnlyItemsModifiedBefore)
+            {
+                LogVerbose "Item modified date ($modifiedDate) is not before $($script:OnlyItemsModifiedBefore), skipping"
+                return $false
+            }
+        }
+        
+        if ($script:OnlyItemsModifiedAfter -and $metadataObj.lastModifiedDateTime)
+        {
+            $modifiedDate = [DateTime]::Parse($metadataObj.lastModifiedDateTime)
+            if ($modifiedDate -le $script:OnlyItemsModifiedAfter)
+            {
+                LogVerbose "Item modified date ($modifiedDate) is not after $($script:OnlyItemsModifiedAfter), skipping"
+                return $false
+            }
+        }
+        
+        # All date checks passed (or no relevant dates in metadata)
+        return $true
+    }
+    catch
+    {
+        Log "Failed to parse metadata for date validation: $($_.Exception.Message)" Yellow
+        # Default to processing if metadata can't be parsed
+        return $true
+    }
+}
+
 # Function to get items from a folder using the export API (beta endpoint)
 function ListItemsForExport($folderId, $folderName)
 {
@@ -808,6 +975,14 @@ function ListItemsForExport($folderId, $folderName)
     # Use the correct mailbox export API endpoint
     # GET /admin/exchange/mailboxes/{mailboxId}/folders/{mailboxFolderId}/items
     $url = "https://graph.microsoft.com/beta/admin/exchange/mailboxes/$SourceMailbox/folders/$folderId/items"
+    
+    # Apply date filter if any date parameters are specified
+    $dateFilter = Get-DateFilterForExport
+    if ($dateFilter)
+    {
+        $url += "?`$filter=$dateFilter"
+        Log "Applying date filter for export: $dateFilter"
+    }
     
     do
     {
@@ -1640,6 +1815,13 @@ function ImportFromFileSystem()
                 {
                     LogVerbose "Failed to parse metadata: $($_.Exception.Message)"
                 }
+            }
+            
+            # Validate date range before importing
+            if (-not (Test-ItemDateWithinRange $exportedItem.metadata))
+            {
+                LogVerbose "Item does not meet date criteria, skipping: $($file.Name)"
+                continue
             }
             
             LogVerbose "Importing message: (Received: $receivedDateTime)"
