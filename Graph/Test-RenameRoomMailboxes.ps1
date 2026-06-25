@@ -1,5 +1,5 @@
 #
-# Rename-RoomMailboxes.ps1
+# Test-RenameRoomMailboxes.ps1
 #
 # By David Barrett, Microsoft Ltd. Use at your own risk.  No warranties are given.
 #
@@ -14,52 +14,37 @@
 
 <#
 .SYNOPSIS
-Processes room mailbox calendar events by removing and re-adding the room to organizer's events.
+Creates test calendar events for testing Rename-RoomMailboxes.ps1.
 
 .DESCRIPTION
-This script processes calendar events for specified room mailboxes occurring on or after a given date.
-For each event, the script locates the organizer's copy of the event and performs the following actions:
-1. Removes the room mailbox from the organizer's event attendees list
-2. Saves the updated event and waits for the event to be removed from the room's calendar
-3. Re-adds the room mailbox to the organizer's event attendees list (preserving the room's display name)
-4. Saves the event again
-5. Allows the room mailbox to auto-process the meeting invitation
+This script creates calendar events for specified organisers with room mailboxes as locations.
+For each organiser, the script creates the specified number of meetings with:
+- Room mailboxes as locations (cycling through the provided list)
+- Other organisers as attendees
+- Events scheduled starting from tomorrow, one hour apart
 
-This can be useful for refreshing room bookings or forcing synchronization of room calendar entries.
-
-The script uses application permissions and requires access to all calendars in the organization.
-Events are identified across mailboxes using the iCalUId property to ensure the correct event is updated.
-
-IMPORTANT: Room mailboxes must be configured to automatically accept meeting invitations. The script
-relies on the room's auto-accept processing to handle the re-added invitation after removal.
+This is useful for creating test data to validate the Rename-RoomMailboxes.ps1 script functionality.
 
 .PREREQUISITES
-Entra ID App Registration:
-- Register an application in the Entra ID (Azure AD) portal
-- Create a client secret for the application
-- Configure the following API permissions:
-  * Microsoft Graph > Application Permissions > Calendars.ReadWrite (required)
-  * Microsoft Graph > Application Permissions > User.Read.All (optional, if needed to resolve user information)
+Entra ID App Registration with the following permissions:
+- Microsoft Graph > Application Permissions > Calendars.ReadWrite
+- Microsoft Graph > Application Permissions > User.Read.All
 - Grant admin consent for the permissions in your tenant
-- Note the Application (client) ID, Directory (tenant) ID, and client secret value
 
-IMPORTANT: This script requires application permissions (client credential flow) and will not work with delegate permissions.
-The AppSecretKey parameter must be provided to authenticate using application permissions.
-
-.EXAMPLE
-$roomMailboxes = @("confroom1@contoso.com")
-$startDate = [DateTime]::Today.AddDays(7)
-.\Rename-RoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -RoomMailboxes $roomMailboxes -StartDate $startDate
-
-Processes all calendar events for confroom1@contoso.com starting 7 days from now. The script will delete each event from the room's calendar, remove and re-add the room to the organizer's event, then programmatically accept the meeting on behalf of the room.
+IMPORTANT: This script requires application permissions (client credential flow).
+The AppSecretKey parameter must be provided.
 
 .EXAMPLE
-$roomMailboxes = @("room1@contoso.com", "room2@contoso.com", "room3@contoso.com")
-$startDate = [DateTime]::Today.AddDays(7)
-.\Rename-RoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -RoomMailboxes $roomMailboxes -StartDate $startDate -LogToFile
+$organisers = @("user1@contoso.com", "user2@contoso.com")
+$rooms = @("room1@contoso.com", "room2@contoso.com")
+.\Test-RenameRoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -Organisers $organisers -RoomMailboxes $rooms -MeetingsPerOrganiser 5
 
-Processes multiple room mailboxes starting 7 days from now, with all activity logged to a file.
-Room mailboxes will auto-process the refreshed meeting invitations.
+Creates 5 test meetings for each organiser (10 total), cycling through the room mailboxes as locations.
+
+.EXAMPLE
+.\Test-RenameRoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -Organisers @("user@contoso.com") -RoomMailboxes @("room@contoso.com") -MeetingsPerOrganiser 10 -LogToFile
+
+Creates 10 test meetings for a single organiser with logging enabled.
 
 #>
 
@@ -107,13 +92,23 @@ param (
     [string]$Mailbox = "me",
 <# Mailbox.ps1 %PARAMS_END% #>
 
-    [Parameter(Mandatory=$True,HelpMessage="Array of room mailbox SMTP addresses to process.")]
+    [Parameter(Mandatory=$True,HelpMessage="Array of organiser email addresses who will create the test meetings.")]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$Organisers,
+
+    [Parameter(Mandatory=$True,HelpMessage="Array of room mailbox SMTP addresses to use as meeting locations.")]
     [ValidateNotNullOrEmpty()]
     [string[]]$RoomMailboxes,
 
-    [Parameter(Mandatory=$True,HelpMessage="Process events occurring on or after this date (format: yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss).")]
-    [ValidateNotNullOrEmpty()]
-    [string]$StartDate
+    [Parameter(Mandatory=$True,HelpMessage="Number of test meetings to create for each organiser.")]
+    [ValidateRange(1,100)]
+    [int]$MeetingsPerOrganiser,
+
+    [Parameter(Mandatory=$False,HelpMessage="Clear all existing calendar events from room mailboxes and organisers before creating new test meetings.")]
+    [switch]$Clear,
+
+    [Parameter(Mandatory=$False,HelpMessage="Clear all existing calendar events from room mailboxes and organisers, then exit without creating new meetings.")]
+    [switch]$ClearOnly
 )
 
 $script:ScriptVersion = "1.0.0"
@@ -431,10 +426,7 @@ function POST($url, $body, $contentType="application/json")
     catch
     {
         Write-Host "POST failed to URL: $url" -ForegroundColor Red
-        return $null
     }
-    # Return result or empty string (HTTP 202 with no content is success)
-    if ($null -eq $result) { return "" }
     return $result
 }
 
@@ -458,14 +450,12 @@ function DELETE($url)
     try
     {
         $result = TraceInvokeRestMethod "DELETE" $url
-        # DELETE with 204 NoContent returns no content, so return true to indicate success
-        return $true
     }
     catch
     {
         Write-Host "DELETE failed at URL: $url" -ForegroundColor Red
-        return $false
     }
+    return $result
 }
 
 function rawGET($url)
@@ -535,7 +525,10 @@ function DeleteFolderMessageById($folderId, $messageId)
 {
     $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId"
     $response = DELETE $url
-    # DELETE returns true/false indicating success
+    if ($null -eq $response)
+    {
+        return $null
+    }    
     return $response
 }
 
@@ -544,118 +537,157 @@ function DeleteFolderMessageById($folderId, $messageId)
 
 # Calendar-specific functions
 
-function GetCalendarEvents($mailbox, $queryString)
+function GetRoomDisplayName($roomMailbox)
 {
-    # Get calendar events for a specific mailbox
-    $url = "https://graph.microsoft.com/v1.0/users/$mailbox/calendar/events$queryString"
+    # Get the display name of a room mailbox from Graph
+    $url = "https://graph.microsoft.com/v1.0/users/$roomMailbox`?`$select=displayName"
     $response = GET $url
+    
     if ($null -eq $response)
     {
-        return $null
+        # If we can't get the display name, fall back to email address
+        LogVerbose "Could not retrieve display name for $roomMailbox, using email address"
+        return $roomMailbox.Split('@')[0]
     }
-    return ConvertFrom-Json ($response)
+    
+    $userObject = ConvertFrom-Json $response
+    return $userObject.displayName
 }
 
-function GetEventById($mailbox, $eventId, $queryString)
+function ClearCalendarEvents($mailbox)
 {
-    # Get a specific event by ID
-    $url = "https://graph.microsoft.com/v1.0/users/$mailbox/events/$eventId$queryString"
+    # Delete all calendar events for a mailbox
+    Log "  Retrieving events for $mailbox..." Gray
+    
+    $url = "https://graph.microsoft.com/v1.0/users/$mailbox/calendar/events"
     $response = GET $url
+    
     if ($null -eq $response)
     {
-        return $null
+        Log "    Could not retrieve events" Yellow
+        return 0
     }
-    return ConvertFrom-Json ($response)
-}
-
-function UpdateEvent($mailbox, $eventId, $body)
-{
-    # Update an event using PATCH
-    $url = "https://graph.microsoft.com/v1.0/users/$mailbox/events/$eventId"
-    $response = PATCH $url $body
-    if ($null -eq $response)
+    
+    $eventsResponse = ConvertFrom-Json $response
+    $events = $eventsResponse.value
+    $totalEvents = $events.Count
+    
+    # Handle pagination
+    while ($null -ne $eventsResponse.'@odata.nextLink')
     {
-        return $null
-    }
-    return ConvertFrom-Json ($response)
-}
-
-function FindEventByICalUId($mailbox, $iCalUId)
-{
-    # Find an event in a mailbox by its iCalUId
-    $queryString = "?`$filter=iCalUId eq '$iCalUId'&`$select=id,subject,start,end,organizer,attendees,iCalUId"
-    $response = GetCalendarEvents $mailbox $queryString
-    if ($null -eq $response -or $null -eq $response.value -or $response.value.Count -eq 0)
-    {
-        return $null
-    }
-    return $response.value[0]
-}
-
-function RemoveAttendee($attendeesArray, $emailAddress)
-{
-    # Remove an attendee from the attendees array
-    # Ensure input is treated as an array (PowerShell can unwrap single-element arrays)
-    $attendees = @($attendeesArray)
-    $newAttendees = @()
-    foreach ($attendee in $attendees)
-    {
-        if ($attendee.emailAddress.address -ne $emailAddress)
+        $response = GET $eventsResponse.'@odata.nextLink'
+        if ($null -ne $response)
         {
-            $newAttendees += $attendee
+            $eventsResponse = ConvertFrom-Json $response
+            $events += $eventsResponse.value
+            $totalEvents = $events.Count
         }
     }
-    return $newAttendees
-}
-
-function AddAttendee($attendeesArray, $emailAddress, $attendeeType = "required", $displayName = $null)
-{
-    # Add an attendee to the attendees array with optional display name
-    # Ensure input is treated as an array (PowerShell can unwrap single-element arrays)
-    $attendees = @($attendeesArray)
     
-    $emailAddressObj = @{
-        address = $emailAddress
-    }
-    
-    # Include display name if provided
-    if (![String]::IsNullOrEmpty($displayName))
+    if ($totalEvents -eq 0)
     {
-        $emailAddressObj.name = $displayName
+        Log "    No events to delete" Gray
+        return 0
     }
     
-    $newAttendee = @{
-        emailAddress = $emailAddressObj
-        type = $attendeeType
-    }
-    $attendees += $newAttendee
-    return $attendees
-}
-
-function DeleteEventFromCalendar($mailbox, $iCalUId, $eventId = $null)
-{
-    # Delete an event from a mailbox's calendar
-    # If eventId is provided, use it directly; otherwise search by iCalUId
+    Log "    Found $totalEvents event(s), deleting..." Gray
     
-    if ([String]::IsNullOrEmpty($eventId))
+    $deletedCount = 0
+    $failedCount = 0
+    foreach ($event in $events)
     {
-        # Find the event by iCalUId if no event ID was provided
-        $event = FindEventByICalUId $mailbox $iCalUId
+        $deleteUrl = "https://graph.microsoft.com/v1.0/users/$mailbox/events/$($event.id)"
         
-        if ($null -eq $event)
+        # Store error count before DELETE
+        $errorCountBefore = $Error.Count
+        $result = DELETE $deleteUrl
+        
+        # If no new errors were added, deletion succeeded
+        # (DELETE returns empty string for HTTP 204 success)
+        if ($Error.Count -eq $errorCountBefore)
         {
-            return $false
+            $deletedCount++
         }
-        
-        $eventId = $event.id
+        else
+        {
+            $failedCount++
+        }
     }
     
-    $url = "https://graph.microsoft.com/v1.0/users/$mailbox/events/$eventId"
-    $response = DELETE $url
-    
-    # DELETE returns true/false indicating success
-    return $response
+    if ($failedCount -gt 0)
+    {
+        Log "    Deleted $deletedCount of $totalEvents event(s), $failedCount failed" Yellow
+    }
+    else
+    {
+        Log "    Deleted $deletedCount of $totalEvents event(s)" Green
+    }
+    return $deletedCount
 }
+
+function CreateCalendarEvent($organizerEmail, $subject, $startDateTime, $endDateTime, $locationEmail, $locationDisplayName, $attendeesArray)
+{
+    # Create a calendar event for an organiser
+    $url = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events"
+    
+    # Build location object with actual display name
+    $location = @{
+        displayName = $locationDisplayName
+        locationType = "conferenceRoom"
+        uniqueId = $locationEmail
+        uniqueIdType = "directory"
+    }
+    
+    # Build attendees array
+    $attendees = @()
+    
+    # Add the room mailbox as a resource attendee first
+    $attendees += @{
+        emailAddress = @{
+            address = $locationEmail
+            name = $locationDisplayName
+        }
+        type = "resource"
+    }
+    
+    # Add other attendees
+    foreach ($attendeeEmail in $attendeesArray)
+    {
+        $attendees += @{
+            emailAddress = @{
+                address = $attendeeEmail
+                name = $attendeeEmail
+            }
+            type = "required"
+        }
+    }
+    
+    # Build event body
+    $eventBody = @{
+        subject = $subject
+        start = @{
+            dateTime = $startDateTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            timeZone = "UTC"
+        }
+        end = @{
+            dateTime = $endDateTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            timeZone = "UTC"
+        }
+        location = $location
+        attendees = $attendees
+        isOnlineMeeting = $false
+    } | ConvertTo-Json -Depth 10
+    
+    $response = POST $url $eventBody
+    
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    
+    return ConvertFrom-Json $response
+}
+
 
 # Main code
 
@@ -670,201 +702,138 @@ if ([String]::IsNullOrEmpty($AppSecretKey))
 
 Log "Using application permissions (client credential flow)" Green
 
-# Validate the start date
-try
+# Validate inputs
+if ($Organisers.Count -eq 0)
 {
-    $startDateTime = [DateTime]::Parse($StartDate)
-    Log "Processing events from: $($startDateTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-}
-catch
-{
-    Log "Invalid date format: $StartDate. Please use yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss format." Red
+    Log "ERROR: At least one organiser must be specified." Red
     exit
 }
 
-# Convert to ISO 8601 format for Graph API
-$startDateFilter = $startDateTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-# Process each room mailbox
-$totalRooms = $RoomMailboxes.Count
-$currentRoom = 0
-
-foreach ($roomMailbox in $RoomMailboxes)
+if ($RoomMailboxes.Count -eq 0)
 {
-    $currentRoom++
-    Log "`n[$currentRoom/$totalRooms] Processing room mailbox: $roomMailbox" Cyan
+    Log "ERROR: At least one room mailbox must be specified." Red
+    exit
+}
+
+Log "Configuration:" Cyan
+Log "  Organisers: $($Organisers.Count)"
+Log "  Room Mailboxes: $($RoomMailboxes.Count)"
+if (-not $ClearOnly)
+{
+    Log "  Meetings per Organiser: $MeetingsPerOrganiser"
+    Log "  Total meetings to create: $($Organisers.Count * $MeetingsPerOrganiser)"
+}
+Log "  Clear existing events: $($Clear -or $ClearOnly)"
+if ($ClearOnly)
+{
+    Log "  Clear only mode: Will exit after clearing events" Yellow
+}
+Log ""
+
+# Clear existing calendar events if requested
+if ($Clear -or $ClearOnly)
+{
+    Log "Clearing existing calendar events..." Cyan
     
-    # Get calendar events for the room mailbox that start on or after the specified date
-    $filter = "`$filter=start/dateTime ge '$startDateFilter'"
-    $select = "`$select=id,subject,start,end,organizer,attendees,iCalUId"
-    $queryString = "?$filter&$select&`$top=999"
-    
-    $eventsResponse = GetCalendarEvents $roomMailbox $queryString
-    
-    if ($null -eq $eventsResponse -or $null -eq $eventsResponse.value)
+    # Clear organiser calendars first (this should cancel room events)
+    Log "Clearing organiser calendars:" Cyan
+    $totalOrganiserEventsDeleted = 0
+    foreach ($organiser in $Organisers)
     {
-        Log "  Unable to retrieve events for $roomMailbox" Yellow
-        continue
+        $deleted = ClearCalendarEvents $organiser
+        $totalOrganiserEventsDeleted += $deleted
     }
+    Log "  Total organiser events deleted: $totalOrganiserEventsDeleted" Green
+    Log ""
     
-    $events = $eventsResponse.value
-    $totalEvents = $events.Count
-    
-    if ($totalEvents -eq 0)
+    # Clear room mailboxes (to clean up any remaining events)
+    Log "Clearing room mailbox calendars:" Cyan
+    $totalRoomEventsDeleted = 0
+    foreach ($room in $RoomMailboxes)
     {
-        Log "  Room calendar is currently empty" Yellow
-        Log "  Note: If this room was recently processed, events may have been deleted and new invitations may still be arriving" Gray
-        continue
+        $deleted = ClearCalendarEvents $room
+        $totalRoomEventsDeleted += $deleted
     }
+    Log "  Total room events deleted: $totalRoomEventsDeleted" Green
+    Log ""
     
-    Log "  Found $totalEvents event(s) to process"
-    
-    # Process pagination if there are more events
-    while ($null -ne $eventsResponse.'@odata.nextLink')
+    # If ClearOnly mode, exit now
+    if ($ClearOnly)
     {
-        $eventsResponse = GET $eventsResponse.'@odata.nextLink'
-        if ($null -ne $eventsResponse)
-        {
-            $eventsResponse = ConvertFrom-Json $eventsResponse
-            $events += $eventsResponse.value
-            $totalEvents = $events.Count
-            Log "  Retrieved additional events, total now: $totalEvents"
-        }
-    }
-    
-    $currentEvent = 0
-    foreach ($event in $events)
-    {
-        $currentEvent++
-        Log "  [$currentEvent/$totalEvents] Processing event: $($event.subject)" Gray
-        
-        # Get the organizer email address
-        $organizerEmail = $event.organizer.emailAddress.address
-        if ([String]::IsNullOrEmpty($organizerEmail))
-        {
-            Log "    Skipping: No organizer found" Yellow
-            continue
-        }
-        
-        Log "    Organizer: $organizerEmail"
-        
-        # Find the same event in the organizer's calendar using iCalUId
-        $iCalUId = $event.iCalUId
-        if ([String]::IsNullOrEmpty($iCalUId))
-        {
-            Log "    Skipping: No iCalUId found for event" Yellow
-            continue
-        }
-        
-        Log "    Finding event in organizer's calendar (iCalUId: $iCalUId)"
-        $organizerEvent = FindEventByICalUId $organizerEmail $iCalUId
-        
-        if ($null -eq $organizerEvent)
-        {
-            Log "    Skipping: Could not find event in organizer's calendar" Yellow
-            continue
-        }
-        
-        Log "    Found event in organizer's calendar (ID: $($organizerEvent.id))"
-        
-        # Check if the room is actually in the attendees list and capture display name
-        $roomIsAttendee = $false
-        $roomDisplayName = $roomMailbox  # Default to email address
-        foreach ($attendee in $organizerEvent.attendees)
-        {
-            if ($attendee.emailAddress.address -eq $roomMailbox)
-            {
-                $roomIsAttendee = $true
-                if (![String]::IsNullOrEmpty($attendee.emailAddress.name))
-                {
-                    $roomDisplayName = $attendee.emailAddress.name
-                }
-                break
-            }
-        }
-        
-        if (-not $roomIsAttendee)
-        {
-            Log "    Skipping: Room $roomMailbox is not an attendee of this event" Yellow
-            continue
-        }
-        
-        # Remove the room mailbox from attendees and send update
-        Log "    Removing room from organizer's event attendees list"
-        $updatedAttendees = RemoveAttendee $organizerEvent.attendees $roomMailbox
-        
-        $updateBody = @{
-            attendees = @($updatedAttendees)
-        } | ConvertTo-Json -Depth 10 -Compress:$false
-        
-        $updateResult = UpdateEvent $organizerEmail $organizerEvent.id $updateBody
-        
-        if ($null -eq $updateResult)
-        {
-            Log "    ERROR: Failed to remove room from event" Red
-            continue
-        }
-        
-        Log "    Successfully removed room from organizer's event" Green
-        
-        # Wait for the event to be deleted from the room's calendar
-        Log "    Waiting for event to be removed from room's calendar..."
-        $maxWaitAttempts = 12  # Wait up to 60 seconds (12 * 5 seconds)
-        $eventRemovedFromRoom = $false
-        
-        for ($waitAttempt = 1; $waitAttempt -le $maxWaitAttempts; $waitAttempt++)
-        {
-            Start-Sleep -Seconds 5
-            
-            # Check if the event still exists in the room's calendar
-            $roomEventCheck = FindEventByICalUId $roomMailbox $iCalUId
-            
-            if ($null -eq $roomEventCheck)
-            {
-                Log "    Event successfully removed from room's calendar" Green
-                $eventRemovedFromRoom = $true
-                break
-            }
-            else
-            {
-                Log "    Waiting for event removal (attempt $waitAttempt/$maxWaitAttempts)..." Gray
-            }
-        }
-        
-        if (-not $eventRemovedFromRoom)
-        {
-            Log "    Warning: Event still exists in room's calendar after waiting" Yellow
-            Log "    Continuing anyway - the room may process the update shortly" Yellow
-        }
-        
-        # Add the room mailbox back to attendees with display name and set location
-        Log "    Adding room back to organizer's event attendees list and setting location"
-        $readdedAttendees = AddAttendee $updatedAttendees $roomMailbox "required" $roomDisplayName
-        
-        # Also update the location to point to the room mailbox
-        $location = @{
-            displayName = $roomDisplayName
-            locationType = "conferenceRoom"
-            uniqueId = $roomMailbox
-            uniqueIdType = "directory"
-        }
-        
-        $readdBody = @{
-            attendees = @($readdedAttendees)
-            location = $location
-        } | ConvertTo-Json -Depth 10 -Compress:$false
-        
-        $readdResult = UpdateEvent $organizerEmail $organizerEvent.id $readdBody
-        
-        if ($null -eq $readdResult)
-        {
-            Log "    ERROR: Failed to add room back to event" Red
-            continue
-        }
-        
-        Log "    Successfully added room back to organizer's event" Green
-        Log "    Room will auto-process the meeting invitation" Gray
+        Log "ClearOnly mode: Exiting after clearing events" Green
+        exit
     }
 }
 
-Log "`nCompleted processing all room mailboxes" Green
+# Get display names for all room mailboxes
+Log "Retrieving room display names..." Cyan
+$roomDisplayNames = @{}
+foreach ($room in $RoomMailboxes)
+{
+    $displayName = GetRoomDisplayName $room
+    $roomDisplayNames[$room] = $displayName
+    Log "  $room -> $displayName" Gray
+}
+Log ""
+
+# Start creating meetings from tomorrow
+$startDate = [DateTime]::Today.AddDays(1).AddHours(9) # Start at 9 AM tomorrow
+$currentRoomIndex = 0
+$totalMeetingsCreated = 0
+$totalMeetingsFailed = 0
+$globalMeetingNumber = 0 # Track meeting number across all organisers
+
+foreach ($organiser in $Organisers)
+{
+    Log "Processing organiser: $organiser" Cyan
+    
+    # Build attendees list (all other organisers)
+    $attendeesList = $Organisers | Where-Object { $_ -ne $organiser }
+    
+    for ($i = 1; $i -le $MeetingsPerOrganiser; $i++)
+    {
+        # Select room mailbox (cycle through the list)
+        $roomMailbox = $RoomMailboxes[$currentRoomIndex]
+        $currentRoomIndex = ($currentRoomIndex + 1) % $RoomMailboxes.Count
+        
+        # Calculate meeting times (1 hour meetings, 1 hour apart)
+        # Use global counter to prevent conflicts across organisers
+        $meetingStart = $startDate.AddHours($globalMeetingNumber * 2)
+        $meetingEnd = $meetingStart.AddHours(1)
+        $globalMeetingNumber++
+        
+        # Get room display name
+        $roomDisplayName = $roomDisplayNames[$roomMailbox]
+        $subject = "Meeting $i in $roomDisplayName"
+        
+        Log "  [$i/$MeetingsPerOrganiser] Creating: '$subject'" Gray
+        Log "    Room: $roomMailbox"
+        Log "    Time: $($meetingStart.ToString('yyyy-MM-dd HH:mm')) - $($meetingEnd.ToString('HH:mm')) UTC"
+        Log "    Attendees: $($attendeesList.Count)"
+        
+        # Create the event
+        $result = CreateCalendarEvent $organiser $subject $meetingStart $meetingEnd $roomMailbox $roomDisplayName $attendeesList
+        
+        if ($null -ne $result)
+        {
+            Log "    SUCCESS: Event created (ID: $($result.id))" Green
+            $totalMeetingsCreated++
+        }
+        else
+        {
+            Log "    FAILED: Could not create event" Red
+            $totalMeetingsFailed++
+        }
+    }
+    
+    Log ""
+}
+
+Log "Summary:" Cyan
+Log "  Total meetings created: $totalMeetingsCreated" Green
+if ($totalMeetingsFailed -gt 0)
+{
+    Log "  Total meetings failed: $totalMeetingsFailed" Red
+}
+Log ""
+Log "Completed" Green
