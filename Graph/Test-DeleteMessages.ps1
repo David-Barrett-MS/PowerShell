@@ -17,7 +17,7 @@
 Tests message copy and delete operations via Microsoft Graph API, measuring latency and performance.
 
 .DESCRIPTION
-This script performs a comprehensive test of message copy and delete operations in a user's mailbox:
+This script performs a test of message copy and delete operations in a user's mailbox:
 1. Creates a test folder with subfolders in the Inbox
 2. Copies a specified number of messages from Inbox to the subfolders (cycling through source messages if needed)
 3. Optionally pauses before deletion
@@ -25,12 +25,12 @@ This script performs a comprehensive test of message copy and delete operations 
 5. Cleans up test folders
 6. Reports detailed timing statistics (min, max, average latency) for both copy and delete operations
 
-The script is useful for performance testing, latency measurement, and verifying message operations via Graph API.
+The script can be helpful for performance testing, latency measurement, and verifying message operations via Graph API.
 
 .EXAMPLE
-.\Test-DeleteMessages.ps1  -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -User $Mailbox -Mailbox $Mailbox -MessageCount 1000 -PauseBeforeDelete
+.\Test-DeleteMessages.ps1  -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -User $Mailbox -MessageCount 100 -PauseBeforeDelete -TraceGraphCalls
 
-Copies 1000 messages from Inbox to test subfolders, pauses for confirmation, then deletes all copied messages and displays performance statistics.
+Copies 100 messages from Inbox to test subfolders, pauses for confirmation, then deletes all copied messages and displays performance statistics.
 
 #>
 
@@ -83,10 +83,14 @@ param (
     [int]$MessageCount,
 
     [Parameter(Mandatory=$False,HelpMessage="If specified, script will pause before deleting messages.")]
-    [switch]$PauseBeforeDelete
+    [switch]$PauseBeforeDelete,
+
+    [Parameter(Mandatory=$False,HelpMessage="Maximum number of concurrent operations (default is 4).")]
+    [ValidateRange(1,20)]
+    [int]$MaxConcurrency = 4
 )
 
-$script:ScriptVersion = "1.0.0"
+$script:ScriptVersion = "1.0.1"
 
 <# Logging.ps1 %FUNCTIONS_START% #>
 if ($LogToFile) {
@@ -432,10 +436,7 @@ function DELETE($url)
     catch
     {
         Write-Host "DELETE failed at URL: $url" -ForegroundColor Red
-        return $null
     }
-    # Return result or empty string (HTTP 204 with no content is success)
-    if ($null -eq $result) { return "" }
     return $result
 }
 
@@ -546,10 +547,10 @@ function CopyMessageToFolder($messageId, $destinationFolderId)
 
 # Main code
 
-# Statistics tracking
-$script:copyLatencies = @()
-$script:deleteLatencies = @()
-$script:copiedMessages = @()
+# Statistics tracking (use thread-safe collections for parallel processing)
+$script:copyLatencies = [System.Collections.Concurrent.ConcurrentBag[double]]::new()
+$script:deleteLatencies = [System.Collections.Concurrent.ConcurrentBag[double]]::new()
+$script:copiedMessages = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
 
 # Step 1: Get Inbox folder
 Log "Getting Inbox folder..." Cyan
@@ -604,50 +605,97 @@ $sourceMessages = $messages.value
 Log "Found $($sourceMessages.Count) messages in Inbox" Green
 
 # Step 4: Copy messages to subfolders
-Log "Copying $MessageCount messages to subfolders..." Cyan
-$messagesCopied = 0
-$currentSubfolderIndex = 0
-$sourceMessageIndex = 0
+Log "Copying $MessageCount messages to subfolders (parallel with max concurrency: $MaxConcurrency)..." Cyan
+$copyTotalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-while ($messagesCopied -lt $MessageCount)
+# Create work items for parallel processing
+$copyWorkItems = @()
+for ($i = 0; $i -lt $MessageCount; $i++)
 {
-    # Get the source message (cycle through if needed)
-    $sourceMessage = $sourceMessages[$sourceMessageIndex % $sourceMessages.Count]
-    $targetFolder = $subfolders[$currentSubfolderIndex]
+    $sourceMessage = $sourceMessages[$i % $sourceMessages.Count]
+    $targetFolder = $subfolders[$i % $subfolders.Count]
+    $copyWorkItems += @{
+        SourceMessageId = $sourceMessage.id
+        TargetFolderId = $targetFolder.id
+        Subject = $sourceMessage.subject
+        Index = $i
+    }
+}
+
+# Process copies in parallel
+$copyWorkItems | ForEach-Object -ThrottleLimit $MaxConcurrency -Parallel {
+    $workItem = $_
+    
+    # Import necessary variables into parallel runspace
+    $graphBaseUrl = $using:graphBaseUrl
+    $oauth = $using:oauth
+    $ConnectionTimeout = $using:ConnectionTimeout
+    $copyLatencies = $using:copyLatencies
+    $copiedMessages = $using:copiedMessages
+    $MessageCount = $using:MessageCount
+    
+    # Inline simplified HTTP POST for message copy
+    $url = $graphBaseUrl + "messages/$($workItem.SourceMessageId)/copy"
+    $body = @{
+        destinationId = $workItem.TargetFolderId
+    } | ConvertTo-Json
+    
+    $headers = @{
+        'Authorization'  = "$($oauth.token_type) $($oauth.access_token)"
+        'Content-Type'   = 'application/json'
+    }
+    
+    $invokeParameters = @{
+        Method = 'POST'
+        Uri = $url
+        Headers = $headers
+        Body = $body
+        ContentType = 'application/json'
+    }
+    
+    if ($PSVersionTable.PSVersion -ge [version]7.4)
+    {
+        $invokeParameters.ConnectionTimeoutSeconds = $ConnectionTimeout
+    }
     
     # Copy the message
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $copiedMessage = CopyMessageToFolder $sourceMessage.id $targetFolder.id
-    $stopwatch.Stop()
-    $latency = $stopwatch.Elapsed.TotalMilliseconds
-    
-    if ($null -eq $copiedMessage)
+    try
     {
-        Log "Failed to copy message ID: $($sourceMessage.id)" Red
-    }
-    else
-    {
-        $script:copyLatencies += $latency
-        $script:copiedMessages += @{
-            Id = $copiedMessage.id
-            FolderId = $targetFolder.id
-            Subject = $sourceMessage.subject
-        }
-        $messagesCopied++
+        $result = Invoke-WebRequest @invokeParameters -ErrorAction Stop
+        $stopwatch.Stop()
+        $latency = $stopwatch.Elapsed.TotalMilliseconds
         
-        if ($messagesCopied % 10 -eq 0)
+        if ($result.Content)
         {
-            Log "Copied $messagesCopied/$MessageCount messages (latest: $([math]::Round($latency, 2)) ms)" Gray
+            $copiedMessage = ConvertFrom-Json $result.Content
+            $copyLatencies.Add($latency)
+            $copiedMessages.Add(@{
+                Id = $copiedMessage.id
+                FolderId = $workItem.TargetFolderId
+                Subject = $workItem.Subject
+            })
+            
+            # Progress reporting
+            $current = $copiedMessages.Count
+            if ($current % 10 -eq 0)
+            {
+                Write-Host "Copied $current/$MessageCount messages (latest: $([math]::Round($latency, 2)) ms)" -ForegroundColor Gray
+            }
         }
     }
-    
-    # Move to next subfolder and source message
-    $currentSubfolderIndex = ($currentSubfolderIndex + 1) % $subfolders.Count
-    $sourceMessageIndex++
+    catch
+    {
+        $stopwatch.Stop()
+        # Silently continue on errors in parallel processing
+    }
 }
 
-Log "Successfully copied $messagesCopied messages" Green
-Log "Copy latency - Min: $([math]::Round(($script:copyLatencies | Measure-Object -Minimum).Minimum, 2)) ms, Max: $([math]::Round(($script:copyLatencies | Measure-Object -Maximum).Maximum, 2)) ms, Avg: $([math]::Round(($script:copyLatencies | Measure-Object -Average).Average, 2)) ms" Cyan
+$copyTotalStopwatch.Stop()
+$messagesCopied = $script:copiedMessages.Count
+Log "Successfully copied $messagesCopied messages in $([math]::Round($copyTotalStopwatch.Elapsed.TotalSeconds, 2)) seconds" Green
+$copyLatenciesArray = $script:copyLatencies.ToArray()
+Log "Copy latency - Min: $([math]::Round(($copyLatenciesArray | Measure-Object -Minimum).Minimum, 2)) ms, Max: $([math]::Round(($copyLatenciesArray | Measure-Object -Maximum).Maximum, 2)) ms, Avg: $([math]::Round(($copyLatenciesArray | Measure-Object -Average).Average, 2)) ms" Cyan
 
 # Step 5: Optional pause before deletion
 if ($PauseBeforeDelete)
@@ -658,74 +706,115 @@ if ($PauseBeforeDelete)
 }
 
 # Step 6: Delete copied messages
-Log "Deleting copied messages..." Cyan
-$messagesDeleted = 0
-foreach ($copiedMsg in $script:copiedMessages)
-{
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $result = DeleteFolderMessageById $copiedMsg.FolderId $copiedMsg.Id
-    $stopwatch.Stop()
-    $latency = $stopwatch.Elapsed.TotalMilliseconds
+Log "Deleting copied messages (parallel with max concurrency: $MaxConcurrency)..." Cyan
+$deleteTotalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+$script:copiedMessages.ToArray() | ForEach-Object -ThrottleLimit $MaxConcurrency -Parallel {
+    $copiedMsg = $_
     
-    if ($null -eq $result)
-    {
-        Log "Failed to delete message ID: $($copiedMsg.Id)" Red
+    # Import necessary variables into parallel runspace
+    $graphBaseUrl = $using:graphBaseUrl
+    $oauth = $using:oauth
+    $ConnectionTimeout = $using:ConnectionTimeout
+    $deleteLatencies = $using:deleteLatencies
+    $messagesCopied = $using:messagesCopied
+    
+    # Inline simplified HTTP DELETE for message deletion
+    $url = $graphBaseUrl + "mailFolders/$($copiedMsg.FolderId)/messages/$($copiedMsg.Id)"
+    
+    $headers = @{
+        'Authorization'  = "$($oauth.token_type) $($oauth.access_token)"
+        'Content-Type'   = 'application/json'
     }
-    else
+    
+    $invokeParameters = @{
+        Method = 'DELETE'
+        Uri = $url
+        Headers = $headers
+        ContentType = 'application/json'
+    }
+    
+    if ($PSVersionTable.PSVersion -ge [version]7.4)
     {
-        $script:deleteLatencies += $latency
-        $messagesDeleted++
+        $invokeParameters.ConnectionTimeoutSeconds = $ConnectionTimeout
+    }
+    
+    # Delete the message
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try
+    {
+        $result = Invoke-WebRequest @invokeParameters -ErrorAction Stop
+        $stopwatch.Stop()
+        $latency = $stopwatch.Elapsed.TotalMilliseconds
         
-        if ($messagesDeleted % 10 -eq 0)
+        $deleteLatencies.Add($latency)
+        
+        # Progress reporting
+        $current = $deleteLatencies.Count
+        if ($current % 10 -eq 0)
         {
-            Log "Deleted $messagesDeleted/$messagesCopied messages (latest: $([math]::Round($latency, 2)) ms)" Gray
+            Write-Host "Deleted $current/$messagesCopied messages (latest: $([math]::Round($latency, 2)) ms)" -ForegroundColor Gray
         }
+    }
+    catch
+    {
+        $stopwatch.Stop()
+        # Silently continue on errors in parallel processing
     }
 }
 
-Log "Successfully deleted $messagesDeleted messages" Green
-Log "Delete latency - Min: $([math]::Round(($script:deleteLatencies | Measure-Object -Minimum).Minimum, 2)) ms, Max: $([math]::Round(($script:deleteLatencies | Measure-Object -Maximum).Maximum, 2)) ms, Avg: $([math]::Round(($script:deleteLatencies | Measure-Object -Average).Average, 2)) ms" Cyan
+$deleteTotalStopwatch.Stop()
+$messagesDeleted = $script:deleteLatencies.Count
+Log "Successfully deleted $messagesDeleted messages in $([math]::Round($deleteTotalStopwatch.Elapsed.TotalSeconds, 2)) seconds" Green
+$deleteLatenciesArray = $script:deleteLatencies.ToArray()
+Log "Delete latency - Min: $([math]::Round(($deleteLatenciesArray | Measure-Object -Minimum).Minimum, 2)) ms, Max: $([math]::Round(($deleteLatenciesArray | Measure-Object -Maximum).Maximum, 2)) ms, Avg: $([math]::Round(($deleteLatenciesArray | Measure-Object -Average).Average, 2)) ms" Cyan
 
 # Step 7: Clean up test folders
 Log "Cleaning up test folders..." Cyan
 foreach ($subfolder in $subfolders)
 {
     $url = $script:graphBaseUrl + "mailFolders/$($subfolder.id)"
-    $result = DELETE $url
-    if ($null -eq $result)
+    try
+    {
+        $null = DELETE $url
+        Log "Deleted subfolder: $($subfolder.displayName)" Gray
+    }
+    catch
     {
         Log "Failed to delete subfolder: $($subfolder.displayName)" Red
-    }
-    else
-    {
-        Log "Deleted subfolder: $($subfolder.displayName)" Gray
     }
 }
 
 # Delete parent test folder
 $url = $script:graphBaseUrl + "mailFolders/$($testFolder.id)"
-$result = DELETE $url
-if ($null -eq $result)
+try
+{
+    $null = DELETE $url
+    Log "Deleted test folder: $testFolderName" Green
+}
+catch
 {
     Log "Failed to delete test folder: $testFolderName" Red
 }
-else
-{
-    Log "Deleted test folder: $testFolderName" Green
-}
 
 # Display summary statistics
+$copyLatenciesArray = $script:copyLatencies.ToArray()
+$deleteLatenciesArray = $script:deleteLatencies.ToArray()
+
 Log "`n========== TEST SUMMARY ==========" Cyan
+Log "Max Concurrency: $MaxConcurrency" White
 Log "Messages copied: $messagesCopied" White
 Log "Messages deleted: $messagesDeleted" White
 Log "`nCopy Operations:" White
-Log "  Min latency: $([math]::Round(($script:copyLatencies | Measure-Object -Minimum).Minimum, 2)) ms" White
-Log "  Max latency: $([math]::Round(($script:copyLatencies | Measure-Object -Maximum).Maximum, 2)) ms" White
-Log "  Avg latency: $([math]::Round(($script:copyLatencies | Measure-Object -Average).Average, 2)) ms" White
+Log "  Total time: $([math]::Round($copyTotalStopwatch.Elapsed.TotalSeconds, 2)) seconds" White
+Log "  Min latency: $([math]::Round(($copyLatenciesArray | Measure-Object -Minimum).Minimum, 2)) ms" White
+Log "  Max latency: $([math]::Round(($copyLatenciesArray | Measure-Object -Maximum).Maximum, 2)) ms" White
+Log "  Avg latency: $([math]::Round(($copyLatenciesArray | Measure-Object -Average).Average, 2)) ms" White
 Log "`nDelete Operations:" White
-Log "  Min latency: $([math]::Round(($script:deleteLatencies | Measure-Object -Minimum).Minimum, 2)) ms" White
-Log "  Max latency: $([math]::Round(($script:deleteLatencies | Measure-Object -Maximum).Maximum, 2)) ms" White
-Log "  Avg latency: $([math]::Round(($script:deleteLatencies | Measure-Object -Average).Average, 2)) ms" White
+Log "  Total time: $([math]::Round($deleteTotalStopwatch.Elapsed.TotalSeconds, 2)) seconds" White
+Log "  Min latency: $([math]::Round(($deleteLatenciesArray | Measure-Object -Minimum).Minimum, 2)) ms" White
+Log "  Max latency: $([math]::Round(($deleteLatenciesArray | Measure-Object -Maximum).Maximum, 2)) ms" White
+Log "  Avg latency: $([math]::Round(($deleteLatenciesArray | Measure-Object -Average).Average, 2)) ms" White
 Log "==================================`n" Cyan
 
 Log "Completed"
