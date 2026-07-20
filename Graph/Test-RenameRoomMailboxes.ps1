@@ -18,12 +18,23 @@ Creates test calendar events for testing Rename-RoomMailboxes.ps1.
 
 .DESCRIPTION
 This script creates calendar events for specified organisers with room mailboxes as locations.
-For each organiser, the script creates the specified number of meetings with:
-- Room mailboxes as locations (cycling through the provided list)
-- Other organisers as attendees
-- Events scheduled starting from tomorrow, one hour apart
+For each organiser, the script creates:
+- Single-instance meetings (specified by -MeetingsPerOrganiser parameter)
+- Recurring meetings (specified by -RecurringMeetingsPerOrganiser parameter, default: 8)
 
-This is useful for creating test data to validate the Rename-RoomMailboxes.ps1 script functionality.
+Single-instance meetings:
+- Scheduled starting from tomorrow at 9 AM, one day apart
+- Room mailboxes cycle through the provided list
+
+Recurring meetings:
+- Start at 1 PM the day after tomorrow
+- Recurrence patterns cycle: daily (7 occurrences), weekly (3 months), monthly (12 months)
+- Every other recurring meeting includes 1-2 cancelled occurrences
+- One in three recurring meetings has a time-modified occurrence (moved forward 1 hour)
+- One in four recurring meetings has a location-modified occurrence (different room)
+
+This is useful for creating test data to validate the Rename-RoomMailboxes.ps1 script functionality,
+especially for testing recurring event handling.
 
 .PREREQUISITES
 Entra ID App Registration with the following permissions:
@@ -39,12 +50,17 @@ $organisers = @("user1@contoso.com", "user2@contoso.com")
 $rooms = @("room1@contoso.com", "room2@contoso.com")
 .\Test-RenameRoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -Organisers $organisers -RoomMailboxes $rooms -MeetingsPerOrganiser 5
 
-Creates 5 test meetings for each organiser (10 total), cycling through the room mailboxes as locations.
+Creates 5 single-instance test meetings for each organiser (10 total), plus 8 recurring meetings per organiser (16 total), cycling through the room mailboxes as locations.
 
 .EXAMPLE
-.\Test-RenameRoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -Organisers @("user@contoso.com") -RoomMailboxes @("room@contoso.com") -MeetingsPerOrganiser 10 -LogToFile
+.\Test-RenameRoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -Organisers @("user@contoso.com") -RoomMailboxes @("room@contoso.com") -MeetingsPerOrganiser 10 -RecurringMeetingsPerOrganiser 12 -LogToFile
 
-Creates 10 test meetings for a single organiser with logging enabled.
+Creates 10 single-instance meetings and 12 recurring meetings for a single organiser with logging enabled.
+
+.EXAMPLE
+.\Test-RenameRoomMailboxes.ps1 -AppId $clientId -AppSecretKey $secretKey -TenantId $tenantId -Organisers @("user@contoso.com") -RoomMailboxes @("room@contoso.com") -MeetingsPerOrganiser 5 -RecurringMeetingsPerOrganiser 0
+
+Creates only single-instance meetings, no recurring meetings.
 
 #>
 
@@ -100,9 +116,13 @@ param (
     [ValidateNotNullOrEmpty()]
     [string[]]$RoomMailboxes,
 
-    [Parameter(Mandatory=$True,HelpMessage="Number of test meetings to create for each organiser.")]
+    [Parameter(Mandatory=$False,HelpMessage="Number of test meetings to create for each organiser.")]
     [ValidateRange(1,100)]
-    [int]$MeetingsPerOrganiser,
+    [int]$MeetingsPerOrganiser = 10,
+
+    [Parameter(Mandatory=$False,HelpMessage="Number of recurring test meetings to create for each organiser (default: 8).")]
+    [ValidateRange(0,50)]
+    [int]$RecurringMeetingsPerOrganiser = 8,
 
     [Parameter(Mandatory=$False,HelpMessage="Clear all existing calendar events from room mailboxes and organisers before creating new test meetings.")]
     [switch]$Clear,
@@ -111,7 +131,7 @@ param (
     [switch]$ClearOnly
 )
 
-$script:ScriptVersion = "1.0.0"
+$script:ScriptVersion = "1.0.1"
 
 <# Logging.ps1 %FUNCTIONS_START% #>
 if ($LogToFile) {
@@ -123,7 +143,9 @@ Function UpdateDetailsWithCallingMethod([string]$Details)
     # Update the log message with details of the function that logged it
     $timeInfo = "$([DateTime]::Now.ToShortDateString()) $([DateTime]::Now.ToLongTimeString())"
     $callingFunction = (Get-PSCallStack)[2].Command # The function we are interested in will always be frame 2 on the stack
-    if (![String]::IsNullOrEmpty($callingFunction))
+    
+    # Only add function name if it's actually a function (not a script file)
+    if (![String]::IsNullOrEmpty($callingFunction) -and $callingFunction -notlike "*.ps1")
     {
         return "$timeInfo [$callingFunction] $Details"
     }
@@ -426,7 +448,10 @@ function POST($url, $body, $contentType="application/json")
     catch
     {
         Write-Host "POST failed to URL: $url" -ForegroundColor Red
+        return $null
     }
+    # Return result or empty string (HTTP 202 with no content is success)
+    if ($null -eq $result) { return "" }
     return $result
 }
 
@@ -454,7 +479,10 @@ function DELETE($url)
     catch
     {
         Write-Host "DELETE failed at URL: $url" -ForegroundColor Red
+        return $null
     }
+    # Return result or empty string (HTTP 204 with no content is success)
+    if ($null -eq $result) { return "" }
     return $result
 }
 
@@ -530,6 +558,34 @@ function DeleteFolderMessageById($folderId, $messageId)
         return $null
     }    
     return $response
+}
+
+function CreateMailboxFolder($parentFolderId, $folderName)
+{
+    $url = $script:graphBaseUrl + "mailFolders/$parentFolderId/childFolders"
+    $body = @{
+        displayName = $folderName
+    } | ConvertTo-Json
+    $response = POST $url $body
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function CopyMessageToFolder($messageId, $destinationFolderId)
+{
+    $url = $script:graphBaseUrl + "messages/$messageId/copy"
+    $body = @{
+        destinationId = $destinationFolderId
+    } | ConvertTo-Json
+    $response = POST $url $body
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
 }
 
 <# Mailbox.ps1 %FUNCTIONS_END% #>
@@ -688,6 +744,346 @@ function CreateCalendarEvent($organizerEmail, $subject, $startDateTime, $endDate
     return ConvertFrom-Json $response
 }
 
+function CreateRecurringCalendarEvent($organizerEmail, $subject, $startDateTime, $endDateTime, $locationEmail, $locationDisplayName, $attendeesArray, $recurrencePattern, $recurrenceRange)
+{
+    # Create a recurring calendar event for an organiser
+    $url = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events"
+    
+    # Build location object with actual display name
+    $location = @{
+        displayName = $locationDisplayName
+        locationType = "conferenceRoom"
+        uniqueId = $locationEmail
+        uniqueIdType = "directory"
+    }
+    
+    # Build attendees array
+    $attendees = @()
+    
+    # Add the room mailbox as a resource attendee first
+    $attendees += @{
+        emailAddress = @{
+            address = $locationEmail
+            name = $locationDisplayName
+        }
+        type = "resource"
+    }
+    
+    # Add other attendees
+    foreach ($attendeeEmail in $attendeesArray)
+    {
+        $attendees += @{
+            emailAddress = @{
+                address = $attendeeEmail
+                name = $attendeeEmail
+            }
+            type = "required"
+        }
+    }
+    
+    # Build recurrence object
+    $recurrence = @{
+        pattern = $recurrencePattern
+        range = $recurrenceRange
+    }
+    
+    # Build event body
+    $eventBody = @{
+        subject = $subject
+        start = @{
+            dateTime = $startDateTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            timeZone = "UTC"
+        }
+        end = @{
+            dateTime = $endDateTime.ToString("yyyy-MM-ddTHH:mm:ss")
+            timeZone = "UTC"
+        }
+        location = $location
+        attendees = $attendees
+        recurrence = $recurrence
+        isOnlineMeeting = $false
+    } | ConvertTo-Json -Depth 10
+    
+    $response = POST $url $eventBody
+    
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    
+    return ConvertFrom-Json $response
+}
+
+function CancelOccurrence($organizerEmail, $seriesMasterId, $occurrenceDate)
+{
+    # Cancel a specific occurrence of a recurring event
+    # First, get the instances to find the occurrence ID
+    # Ensure we're working with UTC times
+    $occurrenceDateUtc = $occurrenceDate.ToUniversalTime()
+    $startDateTime = $occurrenceDateUtc.AddDays(-1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $endDateTime = $occurrenceDateUtc.AddDays(1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $instancesUrl = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events/$seriesMasterId/instances?startDateTime=$startDateTime&endDateTime=$endDateTime"
+    
+    LogVerbose "      Querying instances between $startDateTime and $endDateTime"
+    $response = GET $instancesUrl
+    
+    if ($null -eq $response)
+    {
+        Log "      Failed to get instances for cancellation (window: $startDateTime to $endDateTime)" Red
+        return $false
+    }
+    
+    $instances = ConvertFrom-Json $response
+    if ($null -eq $instances.value -or $instances.value.Count -eq 0)
+    {
+        Log "      No occurrence found to cancel" Yellow
+        return $false
+    }
+    
+    # Find the occurrence that matches our target date/time
+    $targetOccurrence = $null
+    $targetDateStr = $occurrenceDateUtc.ToString('yyyy-MM-ddTHH:mm:ss')
+    foreach ($instance in $instances.value)
+    {
+        $instanceStart = if ($instance.start.dateTime -is [DateTime]) {
+            $instance.start.dateTime
+        } else {
+            # Parse and specify UTC kind to prevent local time conversion
+            $parsed = [DateTime]::Parse($instance.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+            [DateTime]::SpecifyKind($parsed, [DateTimeKind]::Utc)
+        }
+        $instanceStartStr = $instanceStart.ToString('yyyy-MM-ddTHH:mm:ss')
+        
+        if ($instanceStartStr -eq $targetDateStr)
+        {
+            $targetOccurrence = $instance
+            break
+        }
+    }
+    
+    if ($null -eq $targetOccurrence)
+    {
+        Log "      No occurrence found matching $targetDateStr" Yellow
+        return $false
+    }
+    
+    # Cancel the occurrence by sending a cancellation
+    $occurrenceId = $targetOccurrence.id
+    $cancelUrl = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events/$occurrenceId/cancel"
+    
+    $cancelBody = @{
+        comment = "Meeting cancelled"
+    } | ConvertTo-Json
+    
+    $result = POST $cancelUrl $cancelBody
+    
+    if ($null -eq $result)
+    {
+        return $false
+    }
+    
+    return $true
+}
+
+function ModifyOccurrenceTime($organizerEmail, $seriesMasterId, $occurrenceDate, $hourOffset)
+{
+    # Modify the time of a specific occurrence (creates an exception)
+    # First, get the instances to find the occurrence ID
+    # Ensure we're working with UTC times
+    $occurrenceDateUtc = $occurrenceDate.ToUniversalTime()
+    $startDateTime = $occurrenceDateUtc.AddDays(-1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $endDateTime = $occurrenceDateUtc.AddDays(1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $instancesUrl = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events/$seriesMasterId/instances?startDateTime=$startDateTime&endDateTime=$endDateTime"
+    
+    LogVerbose "      Querying instances between $startDateTime and $endDateTime"
+    $response = GET $instancesUrl
+    
+    if ($null -eq $response)
+    {
+        Log "      Failed to get instances for time modification (window: $startDateTime to $endDateTime)" Red
+        return $false
+    }
+    
+    $instances = ConvertFrom-Json $response
+    if ($null -eq $instances.value -or $instances.value.Count -eq 0)
+    {
+        Log "      No occurrence found to modify" Yellow
+        return $false
+    }
+    
+    # Find the occurrence that matches our target date/time
+    $targetOccurrence = $null
+    $targetDateStr = $occurrenceDateUtc.ToString('yyyy-MM-ddTHH:mm:ss')
+    foreach ($instance in $instances.value)
+    {
+        $instanceStart = if ($instance.start.dateTime -is [DateTime]) {
+            $instance.start.dateTime
+        } else {
+            # Parse and specify UTC kind to prevent local time conversion
+            $parsed = [DateTime]::Parse($instance.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+            [DateTime]::SpecifyKind($parsed, [DateTimeKind]::Utc)
+        }
+        $instanceStartStr = $instanceStart.ToString('yyyy-MM-ddTHH:mm:ss')
+        
+        if ($instanceStartStr -eq $targetDateStr)
+        {
+            $targetOccurrence = $instance
+            break
+        }
+    }
+    
+    if ($null -eq $targetOccurrence)
+    {
+        Log "      No occurrence found matching $targetDateStr" Yellow
+        return $false
+    }
+    
+    # Update the occurrence time
+    $occurrenceId = $targetOccurrence.id
+    $occurrence = $targetOccurrence
+    
+    # Parse DateTime - handle both string and DateTime objects
+    $startTime = if ($occurrence.start.dateTime -is [DateTime]) {
+        $occurrence.start.dateTime
+    } else {
+        $parsed = [DateTime]::Parse($occurrence.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+        [DateTime]::SpecifyKind($parsed, [DateTimeKind]::Utc)
+    }
+    
+    $endTime = if ($occurrence.end.dateTime -is [DateTime]) {
+        $occurrence.end.dateTime
+    } else {
+        $parsed = [DateTime]::Parse($occurrence.end.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+        [DateTime]::SpecifyKind($parsed, [DateTimeKind]::Utc)
+    }
+    
+    $newStart = $startTime.AddHours($hourOffset)
+    $newEnd = $endTime.AddHours($hourOffset)
+    
+    $updateUrl = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events/$occurrenceId"
+    $updateBody = @{
+        start = @{
+            dateTime = $newStart.ToString("yyyy-MM-ddTHH:mm:ss")
+            timeZone = $occurrence.start.timeZone
+        }
+        end = @{
+            dateTime = $newEnd.ToString("yyyy-MM-ddTHH:mm:ss")
+            timeZone = $occurrence.end.timeZone
+        }
+    } | ConvertTo-Json -Depth 10
+    
+    $result = PATCH $updateUrl $updateBody
+    
+    if ($null -eq $result)
+    {
+        return $false
+    }
+    
+    return $true
+}
+
+function ModifyOccurrenceLocation($organizerEmail, $seriesMasterId, $occurrenceDate, $newLocationEmail, $newLocationDisplayName)
+{
+    # Modify the location of a specific occurrence (creates an exception)
+    # First, get the instances to find the occurrence ID
+    # Ensure we're working with UTC times
+    $occurrenceDateUtc = $occurrenceDate.ToUniversalTime()
+    $startDateTime = $occurrenceDateUtc.AddDays(-1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $endDateTime = $occurrenceDateUtc.AddDays(1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $instancesUrl = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events/$seriesMasterId/instances?startDateTime=$startDateTime&endDateTime=$endDateTime"
+    
+    LogVerbose "      Querying instances between $startDateTime and $endDateTime"
+    $response = GET $instancesUrl
+    
+    if ($null -eq $response)
+    {
+        Log "      Failed to get instances for location modification (window: $startDateTime to $endDateTime)" Red
+        return $false
+    }
+    
+    $instances = ConvertFrom-Json $response
+    if ($null -eq $instances.value -or $instances.value.Count -eq 0)
+    {
+        Log "      No occurrence found to modify" Yellow
+        return $false
+    }
+    
+    # Find the occurrence that matches our target date/time
+    $targetOccurrence = $null
+    $targetDateStr = $occurrenceDateUtc.ToString('yyyy-MM-ddTHH:mm:ss')
+    foreach ($instance in $instances.value)
+    {
+        $instanceStart = if ($instance.start.dateTime -is [DateTime]) {
+            $instance.start.dateTime
+        } else {
+            # Parse and specify UTC kind to prevent local time conversion
+            $parsed = [DateTime]::Parse($instance.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+            [DateTime]::SpecifyKind($parsed, [DateTimeKind]::Utc)
+        }
+        $instanceStartStr = $instanceStart.ToString('yyyy-MM-ddTHH:mm:ss')
+        
+        if ($instanceStartStr -eq $targetDateStr)
+        {
+            $targetOccurrence = $instance
+            break
+        }
+    }
+    
+    if ($null -eq $targetOccurrence)
+    {
+        Log "      No occurrence found matching $targetDateStr" Yellow
+        return $false
+    }
+    
+    # Update the occurrence location
+    $occurrenceId = $targetOccurrence.id
+    $occurrence = $targetOccurrence
+    
+    # Build new location object
+    $newLocation = @{
+        displayName = $newLocationDisplayName
+        locationType = "conferenceRoom"
+        uniqueId = $newLocationEmail
+        uniqueIdType = "directory"
+    }
+    
+    # Update attendees to include new room instead of old room
+    $updatedAttendees = @()
+    foreach ($attendee in $occurrence.attendees)
+    {
+        # Skip the old room (it was a resource)
+        if ($attendee.type -eq "resource")
+        {
+            continue
+        }
+        $updatedAttendees += $attendee
+    }
+    
+    # Add the new room as a resource attendee
+    $updatedAttendees += @{
+        emailAddress = @{
+            address = $newLocationEmail
+            name = $newLocationDisplayName
+        }
+        type = "resource"
+    }
+    
+    $updateUrl = "https://graph.microsoft.com/v1.0/users/$organizerEmail/events/$occurrenceId"
+    $updateBody = @{
+        location = $newLocation
+        attendees = $updatedAttendees
+    } | ConvertTo-Json -Depth 10
+    
+    $result = PATCH $updateUrl $updateBody
+    
+    if ($null -eq $result)
+    {
+        return $false
+    }
+    
+    return $true
+}
+
 
 # Main code
 
@@ -721,7 +1117,8 @@ Log "  Room Mailboxes: $($RoomMailboxes.Count)"
 if (-not $ClearOnly)
 {
     Log "  Meetings per Organiser: $MeetingsPerOrganiser"
-    Log "  Total meetings to create: $($Organisers.Count * $MeetingsPerOrganiser)"
+    Log "  Recurring Meetings per Organiser: $RecurringMeetingsPerOrganiser"
+    Log "  Total meetings to create: $($Organisers.Count * ($MeetingsPerOrganiser + $RecurringMeetingsPerOrganiser))"
 }
 Log "  Clear existing events: $($Clear -or $ClearOnly)"
 if ($ClearOnly)
@@ -776,8 +1173,8 @@ foreach ($room in $RoomMailboxes)
 }
 Log ""
 
-# Start creating meetings from tomorrow
-$startDate = [DateTime]::Today.AddDays(1).AddHours(9) # Start at 9 AM tomorrow
+# Start creating meetings from tomorrow (UTC)
+$startDate = [DateTime]::SpecifyKind([DateTime]::Today.AddDays(1).AddHours(9), [DateTimeKind]::Utc)
 $currentRoomIndex = 0
 $totalMeetingsCreated = 0
 $totalMeetingsFailed = 0
@@ -796,9 +1193,9 @@ foreach ($organiser in $Organisers)
         $roomMailbox = $RoomMailboxes[$currentRoomIndex]
         $currentRoomIndex = ($currentRoomIndex + 1) % $RoomMailboxes.Count
         
-        # Calculate meeting times (1 hour meetings, 1 hour apart)
+        # Calculate meeting times (1 hour meetings, one day apart)
         # Use global counter to prevent conflicts across organisers
-        $meetingStart = $startDate.AddHours($globalMeetingNumber * 2)
+        $meetingStart = $startDate.AddDays($globalMeetingNumber)
         $meetingEnd = $meetingStart.AddHours(1)
         $globalMeetingNumber++
         
@@ -829,11 +1226,264 @@ foreach ($organiser in $Organisers)
     Log ""
 }
 
+# Create recurring meetings
+if ($RecurringMeetingsPerOrganiser -gt 0)
+{
+    Log "Creating recurring meetings..." Cyan
+    Log ""
+    
+    # Start recurring meetings at 1 PM the day after tomorrow (UTC)
+    $recurringStartDate = [DateTime]::SpecifyKind([DateTime]::Today.AddDays(2).AddHours(13), [DateTimeKind]::Utc)
+    $totalRecurringCreated = 0
+    $totalRecurringFailed = 0
+    
+    # Recurrence pattern cycle: daily, weekly, monthly
+    $recurrencePatterns = @("daily", "weekly", "monthly")
+    $patternIndex = 0
+    
+    foreach ($organiser in $Organisers)
+    {
+        Log "Processing recurring meetings for organiser: $organiser" Cyan
+        
+        # Build attendees list (all other organisers)
+        $attendeesList = $Organisers | Where-Object { $_ -ne $organiser }
+        
+        for ($i = 1; $i -le $RecurringMeetingsPerOrganiser; $i++)
+        {
+            # Select room mailbox (cycle through the list)
+            $roomMailbox = $RoomMailboxes[$currentRoomIndex]
+            $currentRoomIndex = ($currentRoomIndex + 1) % $RoomMailboxes.Count
+            
+            # Get the recurrence pattern for this meeting
+            $patternType = $recurrencePatterns[$patternIndex]
+            $patternIndex = ($patternIndex + 1) % $recurrencePatterns.Length
+            
+            # Calculate meeting times (1 hour meetings, offset by meeting number)
+            $meetingStart = $recurringStartDate.AddHours($i * 2)
+            $meetingEnd = $meetingStart.AddHours(1)
+            
+            # Get room display name
+            $roomDisplayName = $roomDisplayNames[$roomMailbox]
+            $subject = "Recurring Meeting $i ($patternType) in $roomDisplayName"
+            
+            Log "  [$i/$RecurringMeetingsPerOrganiser] Creating: '$subject'" Gray
+            Log "    Room: $roomMailbox"
+            Log "    Pattern: $patternType"
+            Log "    Start: $($meetingStart.ToString('yyyy-MM-dd HH:mm')) UTC"
+            
+            # Build recurrence pattern
+            $recurrencePattern = @{}
+            $recurrenceRange = @{
+                startDate = $meetingStart.ToString("yyyy-MM-dd")
+            }
+            
+            switch ($patternType)
+            {
+                "daily" {
+                    $recurrencePattern = @{
+                        type = "daily"
+                        interval = 1
+                    }
+                    $recurrenceRange.type = "numbered"
+                    $recurrenceRange.numberOfOccurrences = 7
+                    Log "    Occurrences: 7"
+                }
+                "weekly" {
+                    $recurrencePattern = @{
+                        type = "weekly"
+                        interval = 1
+                        daysOfWeek = @($meetingStart.DayOfWeek.ToString().ToLower())
+                    }
+                    $recurrenceRange.type = "endDate"
+                    $recurrenceRange.endDate = $meetingStart.AddMonths(3).ToString("yyyy-MM-dd")
+                    Log "    Duration: 3 months (ends: $($recurrenceRange.endDate))"
+                }
+                "monthly" {
+                    $recurrencePattern = @{
+                        type = "absoluteMonthly"
+                        interval = 1
+                        dayOfMonth = $meetingStart.Day
+                    }
+                    $recurrenceRange.type = "endDate"
+                    $recurrenceRange.endDate = $meetingStart.AddMonths(12).ToString("yyyy-MM-dd")
+                    Log "    Duration: 12 months (ends: $($recurrenceRange.endDate))"
+                }
+            }
+            
+            # Create the recurring event
+            $result = CreateRecurringCalendarEvent $organiser $subject $meetingStart $meetingEnd $roomMailbox $roomDisplayName $attendeesList $recurrencePattern $recurrenceRange
+            
+            if ($null -ne $result)
+            {
+                Log "    SUCCESS: Recurring event created (ID: $($result.id))" Green
+                $totalRecurringCreated++
+                
+                # Add exceptions/cancellations based on rules
+                $addedExceptions = $false
+                
+                # Every other recurring meeting should have cancellations
+                if ($i % 2 -eq 0)
+                {
+                    Log "    Adding cancellations..." Gray
+                    
+                    # Calculate which occurrences to cancel (pick 1st and 3rd for variety)
+                    $cancellations = @()
+                    
+                    switch ($patternType)
+                    {
+                        "daily" {
+                            # Cancel 1st and 3rd occurrence
+                            $cancellations += $meetingStart.AddDays(0) # 1st
+                            if (7 -ge 3) { $cancellations += $meetingStart.AddDays(2) } # 3rd
+                        }
+                        "weekly" {
+                            # Cancel 1st and 3rd week
+                            $cancellations += $meetingStart.AddDays(0) # 1st week
+                            $cancellations += $meetingStart.AddDays(14) # 3rd week
+                        }
+                        "monthly" {
+                            # Cancel 1st and 3rd month
+                            $cancellations += $meetingStart.AddMonths(0) # 1st month
+                            $cancellations += $meetingStart.AddMonths(2) # 3rd month
+                        }
+                    }
+                    
+                    foreach ($cancelDate in $cancellations)
+                    {
+                        Log "      Cancelling occurrence on $($cancelDate.ToUniversalTime().ToString('yyyy-MM-dd HH:mm')) UTC..."
+                        $cancelled = CancelOccurrence $organiser $result.id $cancelDate
+                        if ($cancelled)
+                        {
+                            Log "        Cancelled" Green
+                            $addedExceptions = $true
+                        }
+                        else
+                        {
+                            Log "        Failed to cancel" Red
+                        }
+                        #Start-Sleep -Seconds 1
+                    }
+                }
+                
+                # One in three should have time modified occurrence
+                if ($i % 3 -eq 0)
+                {
+                    Log "    Adding time modification exception..." Gray
+                    
+                    # Modify the 2nd occurrence (move forward 1 hour)
+                    $modifyDate = $null
+                    switch ($patternType)
+                    {
+                        "daily" { $modifyDate = $meetingStart.AddDays(1) }
+                        "weekly" { $modifyDate = $meetingStart.AddDays(7) }
+                        "monthly" { $modifyDate = $meetingStart.AddMonths(1) }
+                    }
+                    
+                    if ($null -ne $modifyDate)
+                    {
+                        Log "      Modifying occurrence on $($modifyDate.ToUniversalTime().ToString('yyyy-MM-dd HH:mm')) UTC (move forward 1 hour)..."
+                        $modified = ModifyOccurrenceTime $organiser $result.id $modifyDate 1
+                        if ($modified)
+                        {
+                            Log "        Modified" Green
+                            $addedExceptions = $true
+                        }
+                        else
+                        {
+                            Log "        Failed to modify" Red
+                        }
+                        #Start-Sleep -Seconds 1
+                    }
+                }
+                
+                # One in four should have location modified occurrence
+                if ($i % 4 -eq 0)
+                {
+                    Log "    Adding location modification exception..." Gray
+                    
+                    # Modify the 2nd occurrence to a different room
+                    # Pick a different room from the list
+                    $alternateRoomIndex = ($currentRoomIndex + 1) % $RoomMailboxes.Count
+                    $alternateRoom = $RoomMailboxes[$alternateRoomIndex]
+                    $alternateRoomDisplayName = $roomDisplayNames[$alternateRoom]
+                    
+                    $modifyDate = $null
+                    switch ($patternType)
+                    {
+                        "daily" { $modifyDate = $meetingStart.AddDays(1) }
+                        "weekly" { $modifyDate = $meetingStart.AddDays(7) }
+                        "monthly" { $modifyDate = $meetingStart.AddMonths(1) }
+                    }
+                    
+                    if ($null -ne $modifyDate)
+                    {
+                        Log "      Modifying occurrence on $($modifyDate.ToUniversalTime().ToString('yyyy-MM-dd HH:mm')) UTC to room $alternateRoom..."
+                        $modified = ModifyOccurrenceLocation $organiser $result.id $modifyDate $alternateRoom $alternateRoomDisplayName
+                        if ($modified)
+                        {
+                            Log "        Modified" Green
+                            $addedExceptions = $true
+                        }
+                        else
+                        {
+                            Log "        Failed to modify" Red
+                        }
+                        #Start-Sleep -Seconds 1
+                    }
+                }
+            }
+            else
+            {
+                Log "    FAILED: Could not create recurring event" Red
+                $totalRecurringFailed++
+            }
+        }
+        
+        Log ""
+    }
+    
+    Log "Recurring meetings summary:" Cyan
+    Log "  Total recurring meetings created: $totalRecurringCreated" Green
+    if ($totalRecurringFailed -gt 0)
+    {
+        Log "  Total recurring meetings failed: $totalRecurringFailed" Red
+    }
+    Log ""
+}
+
 Log "Summary:" Cyan
-Log "  Total meetings created: $totalMeetingsCreated" Green
+Log "  Total single-instance meetings created: $totalMeetingsCreated" Green
 if ($totalMeetingsFailed -gt 0)
 {
-    Log "  Total meetings failed: $totalMeetingsFailed" Red
+    Log "  Total single-instance meetings failed: $totalMeetingsFailed" Red
 }
+if ($RecurringMeetingsPerOrganiser -gt 0)
+{
+    Log "  Total recurring meetings created: $totalRecurringCreated" Green
+    if ($totalRecurringFailed -gt 0)
+    {
+        Log "  Total recurring meetings failed: $totalRecurringFailed" Red
+    }
+}
+Log ""
+
+# Suggest a good start date for testing Rename-RoomMailboxes.ps1
+# Use 3 days from now to test scenario where recurring series start before cutoff but have occurrences after
+$suggestedStartDate = [DateTime]::Today.AddDays(3)
+Log "Suggested start date for Rename-RoomMailboxes.ps1:" Cyan
+Log "  -StartDate $($suggestedStartDate.ToString('yyyy-MM-dd'))" Green
+Log ""
+Log "  Why this date ($($suggestedStartDate.ToString('yyyy-MM-dd')))?:" Cyan
+Log "    - Tests the room rename date scenario" Gray
+Log "    - Single-instance meetings start tomorrow (before cutoff) - will NOT be processed" Gray
+Log "    - Recurring series start day after tomorrow (before cutoff)" Gray
+Log "    - BUT recurring series have occurrences on/after this cutoff - WILL be processed" Gray
+Log "    - Script automatically looks back 1 year to find relevant recurring series" Gray
+Log ""
+Log "  Test coverage with this date:" Gray
+Log "    - Single-instance meetings: Only those on/after cutoff processed" Gray
+Log "    - Daily recurring series: Split at cutoff (occurrences before stay with old room)" Gray
+Log "    - Weekly/monthly recurring: Entire future series gets new room name" Gray
+Log "    - Cancelled/modified occurrences: Properly handled in split series" Gray
 Log ""
 Log "Completed" Green

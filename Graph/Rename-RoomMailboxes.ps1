@@ -107,16 +107,19 @@ param (
     [string]$Mailbox = "me",
 <# Mailbox.ps1 %PARAMS_END% #>
 
+<# Calendar.ps1 %PARAMS_START% #>
+<# Calendar.ps1 %PARAMS_END% #>
+
     [Parameter(Mandatory=$True,HelpMessage="Array of room mailbox SMTP addresses to process.")]
     [ValidateNotNullOrEmpty()]
     [string[]]$RoomMailboxes,
 
-    [Parameter(Mandatory=$True,HelpMessage="Process events occurring on or after this date (format: yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss).")]
+    [Parameter(Mandatory=$True,HelpMessage="Date of the room name change. Single-instance events on/after this date are processed. Recurring series are processed if they have occurrences on/after this date (even if the series started earlier). Format: yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss")]
     [ValidateNotNullOrEmpty()]
     [string]$StartDate
 )
 
-$script:ScriptVersion = "1.0.0"
+$script:ScriptVersion = "1.0.1"
 
 <# Logging.ps1 %FUNCTIONS_START% #>
 if ($LogToFile) {
@@ -128,7 +131,9 @@ Function UpdateDetailsWithCallingMethod([string]$Details)
     # Update the log message with details of the function that logged it
     $timeInfo = "$([DateTime]::Now.ToShortDateString()) $([DateTime]::Now.ToLongTimeString())"
     $callingFunction = (Get-PSCallStack)[2].Command # The function we are interested in will always be frame 2 on the stack
-    if (![String]::IsNullOrEmpty($callingFunction))
+    
+    # Only add function name if it's actually a function (not a script file)
+    if (![String]::IsNullOrEmpty($callingFunction) -and $callingFunction -notlike "*.ps1")
     {
         return "$timeInfo [$callingFunction] $Details"
     }
@@ -458,14 +463,15 @@ function DELETE($url)
     try
     {
         $result = TraceInvokeRestMethod "DELETE" $url
-        # DELETE with 204 NoContent returns no content, so return true to indicate success
-        return $true
     }
     catch
     {
         Write-Host "DELETE failed at URL: $url" -ForegroundColor Red
-        return $false
+        return $null
     }
+    # Return result or empty string (HTTP 204 with no content is success)
+    if ($null -eq $result) { return "" }
+    return $result
 }
 
 function rawGET($url)
@@ -535,15 +541,44 @@ function DeleteFolderMessageById($folderId, $messageId)
 {
     $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId"
     $response = DELETE $url
-    # DELETE returns true/false indicating success
+    if ($null -eq $response)
+    {
+        return $null
+    }    
     return $response
+}
+
+function CreateMailboxFolder($parentFolderId, $folderName)
+{
+    $url = $script:graphBaseUrl + "mailFolders/$parentFolderId/childFolders"
+    $body = @{
+        displayName = $folderName
+    } | ConvertTo-Json
+    $response = POST $url $body
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function CopyMessageToFolder($messageId, $destinationFolderId)
+{
+    $url = $script:graphBaseUrl + "messages/$messageId/copy"
+    $body = @{
+        destinationId = $destinationFolderId
+    } | ConvertTo-Json
+    $response = POST $url $body
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
 }
 
 <# Mailbox.ps1 %FUNCTIONS_END% #>
 
-
-# Calendar-specific functions
-
+<# Calendar.ps1 %FUNCTIONS_START% #>
 function GetCalendarEvents($mailbox, $queryString)
 {
     # Get calendar events for a specific mailbox
@@ -608,6 +643,36 @@ function RemoveAttendee($attendeesArray, $emailAddress)
     return $newAttendees
 }
 
+function GetMailboxDisplayName($mailbox)
+{
+    # Get the current display name for a mailbox (with caching)
+    # Check cache first
+    if ($script:displayNameCache.ContainsKey($mailbox))
+    {
+        return $script:displayNameCache[$mailbox]
+    }
+    
+    # Not in cache, retrieve from Graph API
+    $url = "https://graph.microsoft.com/v1.0/users/$mailbox`?`$select=displayName"
+    $response = GET $url
+    
+    $displayName = $mailbox  # Default to email address
+    
+    if ($null -ne $response)
+    {
+        $user = ConvertFrom-Json $response
+        if (![String]::IsNullOrEmpty($user.displayName))
+        {
+            $displayName = $user.displayName
+        }
+    }
+    
+    # Store in cache
+    $script:displayNameCache[$mailbox] = $displayName
+    
+    return $displayName
+}
+
 function AddAttendee($attendeesArray, $emailAddress, $attendeeType = "required", $displayName = $null)
 {
     # Add an attendee to the attendees array with optional display name
@@ -640,14 +705,14 @@ function DeleteEventFromCalendar($mailbox, $iCalUId, $eventId = $null)
     if ([String]::IsNullOrEmpty($eventId))
     {
         # Find the event by iCalUId if no event ID was provided
-        $event = FindEventByICalUId $mailbox $iCalUId
+        $calendarEvent = FindEventByICalUId $mailbox $iCalUId
         
-        if ($null -eq $event)
+        if ($null -eq $calendarEvent)
         {
             return $false
         }
         
-        $eventId = $event.id
+        $eventId = $calendarEvent.id
     }
     
     $url = "https://graph.microsoft.com/v1.0/users/$mailbox/events/$eventId"
@@ -656,6 +721,140 @@ function DeleteEventFromCalendar($mailbox, $iCalUId, $eventId = $null)
     # DELETE returns true/false indicating success
     return $response
 }
+
+function CreateEvent($mailbox, $body)
+{
+    # Create a new event in a mailbox's calendar
+    $url = "https://graph.microsoft.com/v1.0/users/$mailbox/events"
+    $response = POST $url $body
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function GetEventWithInstances($mailbox, $eventId, $eventStartDate, $eventRecurrence)
+{
+    # Get a recurring event with all its instances (occurrences and exceptions)
+    $queryString = "?`$select=id,subject,start,end,organizer,attendees,iCalUId,type,recurrence,seriesMasterId,location,body,bodyPreview,importance,sensitivity,showAs,isReminderOn,reminderMinutesBeforeStart,responseRequested,allowNewTimeProposals,isOnlineMeeting,onlineMeetingProvider,onlineMeetingUrl,categories"
+    $event = GetEventById $mailbox $eventId $queryString
+    
+    if ($null -eq $event -or $event.type -ne "seriesMaster")
+    {
+        return $event
+    }
+    
+    # Calculate the time window for instances query
+    # Use series start date as the beginning
+    $instancesStart = $eventStartDate.ToString("yyyy-MM-ddTHH:mm:ss")
+    
+    # Calculate end date based on recurrence pattern
+    $instancesEnd = $eventStartDate.AddYears(2)  # Default: 2 years from start
+    
+    if ($null -ne $eventRecurrence -and $null -ne $eventRecurrence.range)
+    {
+        if ($eventRecurrence.range.type -eq "endDate" -and ![String]::IsNullOrEmpty($eventRecurrence.range.endDate))
+        {
+            # Use the series end date plus a buffer
+            $seriesEndDate = [DateTime]::Parse($eventRecurrence.range.endDate, [System.Globalization.CultureInfo]::InvariantCulture)
+            $seriesEndDate = [DateTime]::SpecifyKind($seriesEndDate, [DateTimeKind]::Utc)
+            $instancesEnd = $seriesEndDate.AddDays(1)  # Add 1 day buffer
+        }
+        elseif ($eventRecurrence.range.type -eq "numbered" -and $null -ne $eventRecurrence.range.numberOfOccurrences)
+        {
+            # Estimate end date based on number of occurrences and pattern
+            $occurrences = [int]$eventRecurrence.range.numberOfOccurrences
+            
+            # Calculate estimated duration based on recurrence pattern
+            $pattern = $eventRecurrence.pattern
+            switch ($pattern.type)
+            {
+                "daily" { $instancesEnd = $eventStartDate.AddDays($occurrences * $pattern.interval + 7) }
+                "weekly" { $instancesEnd = $eventStartDate.AddDays(($occurrences * $pattern.interval * 7) + 7) }
+                "monthly" { $instancesEnd = $eventStartDate.AddMonths($occurrences * $pattern.interval + 1) }
+                "yearly" { $instancesEnd = $eventStartDate.AddYears($occurrences * $pattern.interval + 1) }
+                default { $instancesEnd = $eventStartDate.AddYears(2) }
+            }
+        }
+    }
+    
+    # Get instances (occurrences and exceptions) for the series with time window
+    $instancesUrl = "https://graph.microsoft.com/v1.0/users/$mailbox/events/$eventId/instances?startDateTime=$instancesStart&endDateTime=$($instancesEnd.ToString('yyyy-MM-ddTHH:mm:ss'))&`$select=id,subject,start,end,organizer,attendees,iCalUId,type,seriesMasterId,location,body,bodyPreview,importance,sensitivity,showAs,isReminderOn,reminderMinutesBeforeStart,responseRequested,allowNewTimeProposals,isOnlineMeeting,onlineMeetingProvider,onlineMeetingUrl,categories"
+    $instancesResponse = GET $instancesUrl
+    
+    if ($null -ne $instancesResponse)
+    {
+        $instances = ConvertFrom-Json $instancesResponse
+        $event | Add-Member -MemberType NoteProperty -Name "instances" -Value $instances.value -Force
+        
+        # Handle pagination if there are many instances
+        while ($null -ne $instances.'@odata.nextLink')
+        {
+            $instancesResponse = GET $instances.'@odata.nextLink'
+            if ($null -ne $instancesResponse)
+            {
+                $instances = ConvertFrom-Json $instancesResponse
+                $event.instances += $instances.value
+            }
+        }
+    }
+    
+    return $event
+}
+
+function UpdateRecurrenceEndDate($recurrencePattern, $endDate)
+{
+    # Update a recurrence pattern to end on a specific date
+    if ($null -eq $recurrencePattern)
+    {
+        return $null
+    }
+    
+    # Create a copy of the recurrence pattern
+    $updatedRecurrence = $recurrencePattern | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    
+    # Update the range to end on the specified date
+    if ($null -eq $updatedRecurrence.range)
+    {
+        $updatedRecurrence.range = @{}
+    }
+    
+    $updatedRecurrence.range.type = "endDate"
+    $updatedRecurrence.range.endDate = $endDate.ToString("yyyy-MM-dd")
+    
+    # Remove numberOfOccurrences if it exists (can't have both endDate and numberOfOccurrences)
+    if ($updatedRecurrence.range.PSObject.Properties.Name -contains "numberOfOccurrences")
+    {
+        $updatedRecurrence.range.PSObject.Properties.Remove("numberOfOccurrences")
+    }
+    
+    return $updatedRecurrence
+}
+
+function UpdateRecurrenceStartDate($recurrencePattern, $startDate)
+{
+    # Update a recurrence pattern to start on a specific date
+    if ($null -eq $recurrencePattern)
+    {
+        return $null
+    }
+    
+    # Create a copy of the recurrence pattern
+    $updatedRecurrence = $recurrencePattern | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    
+    # Update the range to start on the specified date
+    if ($null -eq $updatedRecurrence.range)
+    {
+        $updatedRecurrence.range = @{}
+    }
+    
+    $updatedRecurrence.range.startDate = $startDate.ToString("yyyy-MM-dd")
+    
+    return $updatedRecurrence
+}
+
+<# Calendar.ps1 %FUNCTIONS_END% #>
 
 # Main code
 
@@ -674,6 +873,8 @@ Log "Using application permissions (client credential flow)" Green
 try
 {
     $startDateTime = [DateTime]::Parse($StartDate)
+    # Specify as UTC to prevent local timezone conversion
+    $startDateTime = [DateTime]::SpecifyKind($startDateTime, [DateTimeKind]::Utc)
     Log "Processing events from: $($startDateTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 }
 catch
@@ -682,8 +883,16 @@ catch
     exit
 }
 
-# Convert to ISO 8601 format for Graph API
-$startDateFilter = $startDateTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+# Convert to ISO 8601 format for Graph API (already UTC, no conversion needed)
+$startDateFilter = $startDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+# For recurring events, we need to look back to catch series masters that start before
+# the cutoff but have occurrences after. Use a 1-year lookback window.
+$lookbackStartDate = $startDateTime.AddYears(-1)
+$lookbackFilter = $lookbackStartDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+# Initialize cache for mailbox display names
+$script:displayNameCache = @{}
 
 # Process each room mailbox
 $totalRooms = $RoomMailboxes.Count
@@ -694,9 +903,15 @@ foreach ($roomMailbox in $RoomMailboxes)
     $currentRoom++
     Log "`n[$currentRoom/$totalRooms] Processing room mailbox: $roomMailbox" Cyan
     
-    # Get calendar events for the room mailbox that start on or after the specified date
-    $filter = "`$filter=start/dateTime ge '$startDateFilter'"
-    $select = "`$select=id,subject,start,end,organizer,attendees,iCalUId"
+    # Get the current display name for the room mailbox
+    Log "  Retrieving current display name for room mailbox..."
+    $roomDisplayName = GetMailboxDisplayName $roomMailbox
+    Log "  Room display name: $roomDisplayName" Gray
+    
+    # Get calendar events for the room mailbox
+    # Use lookback date to catch recurring series that start before cutoff but have occurrences after
+    $filter = "`$filter=start/dateTime ge '$lookbackFilter'"
+    $select = "`$select=id,subject,start,end,organizer,attendees,iCalUId,type,recurrence,seriesMasterId"
     $queryString = "?$filter&$select&`$top=999"
     
     $eventsResponse = GetCalendarEvents $roomMailbox $queryString
@@ -708,16 +923,6 @@ foreach ($roomMailbox in $RoomMailboxes)
     }
     
     $events = $eventsResponse.value
-    $totalEvents = $events.Count
-    
-    if ($totalEvents -eq 0)
-    {
-        Log "  Room calendar is currently empty" Yellow
-        Log "  Note: If this room was recently processed, events may have been deleted and new invitations may still be arriving" Gray
-        continue
-    }
-    
-    Log "  Found $totalEvents event(s) to process"
     
     # Process pagination if there are more events
     while ($null -ne $eventsResponse.'@odata.nextLink')
@@ -727,16 +932,55 @@ foreach ($roomMailbox in $RoomMailboxes)
         {
             $eventsResponse = ConvertFrom-Json $eventsResponse
             $events += $eventsResponse.value
-            $totalEvents = $events.Count
-            Log "  Retrieved additional events, total now: $totalEvents"
         }
     }
+    
+    # Filter events to only those relevant to our cutoff date:
+    # - Single-instance events starting on/after cutoff
+    # - Recurring series (will be checked for occurrences later)
+    $filteredEvents = @()
+    foreach ($event in $events)
+    {
+        if ($event.type -eq "seriesMaster")
+        {
+            # Include all recurring series - we'll check occurrences during processing
+            $filteredEvents += $event
+        }
+        elseif ($event.type -eq "singleInstance")
+        {
+            # Only include single-instance events starting on/after cutoff
+            $eventStartDate = [DateTime]::Parse($event.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+            $eventStartDate = [DateTime]::SpecifyKind($eventStartDate, [DateTimeKind]::Utc)
+            if ($eventStartDate -ge $startDateTime)
+            {
+                $filteredEvents += $event
+            }
+        }
+        # Skip exception and occurrence types - they're part of a series
+    }
+    
+    $totalEvents = $filteredEvents.Count
+    
+    if ($totalEvents -eq 0)
+    {
+        Log "  No events found on/after $($startDateTime.ToString('yyyy-MM-dd'))" Yellow
+        continue
+    }
+    
+    Log "  Found $totalEvents event(s) to process"
     
     $currentEvent = 0
     foreach ($event in $events)
     {
         $currentEvent++
         Log "  [$currentEvent/$totalEvents] Processing event: $($event.subject)" Gray
+        
+        # Skip occurrence and exception events - these will be handled through the series master
+        if ($event.type -eq "occurrence" -or $event.type -eq "exception")
+        {
+            Log "    Skipping: This is an occurrence/exception event (handled through series master)" Yellow
+            continue
+        }
         
         # Get the organizer email address
         $organizerEmail = $event.organizer.emailAddress.address
@@ -747,6 +991,7 @@ foreach ($roomMailbox in $RoomMailboxes)
         }
         
         Log "    Organizer: $organizerEmail"
+        Log "    Event type: $($event.type)"
         
         # Find the same event in the organizer's calendar using iCalUId
         $iCalUId = $event.iCalUId
@@ -767,18 +1012,13 @@ foreach ($roomMailbox in $RoomMailboxes)
         
         Log "    Found event in organizer's calendar (ID: $($organizerEvent.id))"
         
-        # Check if the room is actually in the attendees list and capture display name
+        # Check if the room is actually in the attendees list
         $roomIsAttendee = $false
-        $roomDisplayName = $roomMailbox  # Default to email address
         foreach ($attendee in $organizerEvent.attendees)
         {
             if ($attendee.emailAddress.address -eq $roomMailbox)
             {
                 $roomIsAttendee = $true
-                if (![String]::IsNullOrEmpty($attendee.emailAddress.name))
-                {
-                    $roomDisplayName = $attendee.emailAddress.name
-                }
                 break
             }
         }
@@ -789,6 +1029,279 @@ foreach ($roomMailbox in $RoomMailboxes)
             continue
         }
         
+        # Check if this is a recurring event (seriesMaster) that starts before the cutoff date
+        if ($event.type -eq "seriesMaster")
+        {
+            Log "    This is a recurring event series" Cyan
+            
+            # Parse the event start date (Graph API returns UTC strings)
+            $eventStartDate = [DateTime]::Parse($event.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+            $eventStartDate = [DateTime]::SpecifyKind($eventStartDate, [DateTimeKind]::Utc)
+            
+            # Check if the series starts before the cutoff date
+            if ($eventStartDate -lt $startDateTime)
+            {
+                Log "    Series starts before cutoff date ($($eventStartDate.ToString('yyyy-MM-dd')))" Cyan
+                
+                # Check if the series has ended before the cutoff date
+                if ($null -ne $event.recurrence -and $null -ne $event.recurrence.range)
+                {
+                    if ($event.recurrence.range.type -eq "endDate" -and $null -ne $event.recurrence.range.endDate)
+                    {
+                        $seriesEndDate = [DateTime]::Parse($event.recurrence.range.endDate, [System.Globalization.CultureInfo]::InvariantCulture)
+                        $seriesEndDate = [DateTime]::SpecifyKind($seriesEndDate, [DateTimeKind]::Utc)
+                        
+                        if ($seriesEndDate -lt $startDateTime)
+                        {
+                            Log "    Series ended before cutoff date ($($seriesEndDate.ToString('yyyy-MM-dd'))) - skipping" Yellow
+                            continue
+                        }
+                    }
+                }
+                
+                Log "    Series has occurrences on/after cutoff - will split the series" Cyan
+                
+                # Get the full event details with instances
+                Log "    Retrieving full event details and instances..."
+                $fullOrganizerEvent = GetEventWithInstances $organizerEmail $organizerEvent.id $eventStartDate $event.recurrence
+                
+                if ($null -eq $fullOrganizerEvent)
+                {
+                    Log "    ERROR: Failed to retrieve full event details" Red
+                    continue
+                }
+                
+                # Filter instances to find exceptions and cancellations after the cutoff date
+                # Also count occurrences before and after to determine if splitting is needed
+                $exceptionsAfterCutoff = @()
+                $cancellationsAfterCutoff = @()
+                $occurrencesBeforeCutoff = 0
+                $occurrencesAfterCutoff = 0
+                
+                if ($null -ne $fullOrganizerEvent.instances)
+                {
+                    foreach ($instance in $fullOrganizerEvent.instances)
+                    {
+                        # Parse instance start date (Graph API returns UTC strings)
+                        $instanceStartDate = [DateTime]::Parse($instance.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+                        $instanceStartDate = [DateTime]::SpecifyKind($instanceStartDate, [DateTimeKind]::Utc)
+                        
+                        if ($instanceStartDate -ge $startDateTime)
+                        {
+                            $occurrencesAfterCutoff++
+                            
+                            if ($instance.type -eq "exception")
+                            {
+                                $exceptionsAfterCutoff += $instance
+                            }
+                            elseif ($instance.isCancelled -eq $true)
+                            {
+                                $cancellationsAfterCutoff += $instance
+                            }
+                        }
+                        else
+                        {
+                            $occurrencesBeforeCutoff++
+                        }
+                    }
+                }
+                
+                Log "    Found $occurrencesBeforeCutoff occurrence(s) before cutoff and $occurrencesAfterCutoff after cutoff"
+                Log "    Found $($exceptionsAfterCutoff.Count) exception(s) and $($cancellationsAfterCutoff.Count) cancellation(s) after cutoff date"
+                
+                # If there are no occurrences before the cutoff, don't split - just process normally
+                if ($occurrencesBeforeCutoff -eq 0)
+                {
+                    Log "    No occurrences before cutoff - series will be processed as a whole (not split)" Cyan
+                    # Fall through to standard processing below
+                }
+                else
+                {
+                    # Step 1: Update the original series to end on the day before the cutoff date
+                    Log "    Updating original series to end on $($startDateTime.AddDays(-1).ToString('yyyy-MM-dd'))..."
+                
+                $updatedRecurrence = UpdateRecurrenceEndDate $fullOrganizerEvent.recurrence $startDateTime.AddDays(-1)
+                
+                $updateOriginalBody = @{
+                    recurrence = $updatedRecurrence
+                } | ConvertTo-Json -Depth 10 -Compress:$false
+                
+                $updateOriginalResult = UpdateEvent $organizerEmail $fullOrganizerEvent.id $updateOriginalBody
+                
+                if ($null -eq $updateOriginalResult)
+                {
+                    Log "    ERROR: Failed to update original series end date" Red
+                    continue
+                }
+                
+                Log "    Successfully updated original series end date" Green
+                
+                # Step 2: Create a new series for the remainder with updated room details
+                Log "    Creating new series for remainder starting from $($startDateTime.ToString('yyyy-MM-dd'))..."
+                
+                # Remove the old room and add the new one
+                $newAttendees = RemoveAttendee $fullOrganizerEvent.attendees $roomMailbox
+                $newAttendees = AddAttendee $newAttendees $roomMailbox "required" $roomDisplayName
+                
+                # Update recurrence to start from the cutoff date
+                $newRecurrence = UpdateRecurrenceStartDate $fullOrganizerEvent.recurrence $startDateTime
+                
+                # Copy the range end date from the original if it exists (and is valid)
+                $hasValidEndDate = $false
+                if ($null -ne $fullOrganizerEvent.recurrence.range.endDate)
+                {
+                    $endDateStr = $fullOrganizerEvent.recurrence.range.endDate
+                    # Check if it's a valid date (not the default 0001-01-01)
+                    if ($endDateStr -ne "0001-01-01" -and ![String]::IsNullOrEmpty($endDateStr))
+                    {
+                        $newRecurrence.range.endDate = $endDateStr
+                        $newRecurrence.range.type = "endDate"
+                        $hasValidEndDate = $true
+                        
+                        # Remove numberOfOccurrences if present
+                        if ($newRecurrence.range.PSObject.Properties.Name -contains "numberOfOccurrences")
+                        {
+                            $newRecurrence.range.PSObject.Properties.Remove("numberOfOccurrences")
+                        }
+                    }
+                }
+                
+                if (-not $hasValidEndDate)
+                {
+                    if ($null -ne $fullOrganizerEvent.recurrence.range.numberOfOccurrences)
+                    {
+                        # Keep the numberOfOccurrences (but note this may not be accurate after the split)
+                        $newRecurrence.range.numberOfOccurrences = $fullOrganizerEvent.recurrence.range.numberOfOccurrences
+                        $newRecurrence.range.type = "numbered"
+                        
+                        # Remove endDate if present
+                        if ($newRecurrence.range.PSObject.Properties.Name -contains "endDate")
+                        {
+                            $newRecurrence.range.PSObject.Properties.Remove("endDate")
+                        }
+                    }
+                    else
+                    {
+                        $newRecurrence.range.type = "noEnd"
+                        
+                        # Remove both endDate and numberOfOccurrences if present
+                        if ($newRecurrence.range.PSObject.Properties.Name -contains "endDate")
+                        {
+                            $newRecurrence.range.PSObject.Properties.Remove("endDate")
+                        }
+                        if ($newRecurrence.range.PSObject.Properties.Name -contains "numberOfOccurrences")
+                        {
+                            $newRecurrence.range.PSObject.Properties.Remove("numberOfOccurrences")
+                        }
+                    }
+                }
+                
+                # Update location to the room
+                $newLocation = @{
+                    displayName = $roomDisplayName
+                    locationType = "conferenceRoom"
+                    uniqueId = $roomMailbox
+                    uniqueIdType = "directory"
+                }
+                
+                # Calculate the new start and end times
+                # The new series should start at the same time of day as the original, but on the cutoff date
+                $originalStart = [DateTime]::Parse($fullOrganizerEvent.start.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+                $originalStart = [DateTime]::SpecifyKind($originalStart, [DateTimeKind]::Utc)
+                $originalEnd = [DateTime]::Parse($fullOrganizerEvent.end.dateTime, [System.Globalization.CultureInfo]::InvariantCulture)
+                $originalEnd = [DateTime]::SpecifyKind($originalEnd, [DateTimeKind]::Utc)
+                
+                # Keep the time component from the original start, but use the cutoff date
+                $newSeriesStart = [DateTime]::new($startDateTime.Year, $startDateTime.Month, $startDateTime.Day, 
+                                                   $originalStart.Hour, $originalStart.Minute, $originalStart.Second, 
+                                                   [DateTimeKind]::Utc)
+                
+                # Calculate duration and apply to new start
+                $duration = $originalEnd - $originalStart
+                $newSeriesEnd = $newSeriesStart.Add($duration)
+                
+                # Prepare the new event body
+                $newEventBody = @{
+                    subject = $fullOrganizerEvent.subject
+                    body = $fullOrganizerEvent.body
+                    start = @{
+                        dateTime = $newSeriesStart.ToString("yyyy-MM-ddTHH:mm:ss")
+                        timeZone = $fullOrganizerEvent.start.timeZone
+                    }
+                    end = @{
+                        dateTime = $newSeriesEnd.ToString("yyyy-MM-ddTHH:mm:ss")
+                        timeZone = $fullOrganizerEvent.end.timeZone
+                    }
+                    location = $newLocation
+                    attendees = @($newAttendees)
+                    recurrence = $newRecurrence
+                    importance = $fullOrganizerEvent.importance
+                    sensitivity = $fullOrganizerEvent.sensitivity
+                    showAs = $fullOrganizerEvent.showAs
+                    isReminderOn = $fullOrganizerEvent.isReminderOn
+                    reminderMinutesBeforeStart = $fullOrganizerEvent.reminderMinutesBeforeStart
+                    responseRequested = $fullOrganizerEvent.responseRequested
+                    allowNewTimeProposals = $fullOrganizerEvent.allowNewTimeProposals
+                }
+                
+                # Include online meeting details if present
+                if ($fullOrganizerEvent.isOnlineMeeting -eq $true)
+                {
+                    $newEventBody.isOnlineMeeting = $true
+                    if (![String]::IsNullOrEmpty($fullOrganizerEvent.onlineMeetingProvider))
+                    {
+                        $newEventBody.onlineMeetingProvider = $fullOrganizerEvent.onlineMeetingProvider
+                    }
+                }
+                
+                # Include categories if present
+                if ($null -ne $fullOrganizerEvent.categories -and $fullOrganizerEvent.categories.Count -gt 0)
+                {
+                    $newEventBody.categories = $fullOrganizerEvent.categories
+                }
+                
+                $newEventBodyJson = $newEventBody | ConvertTo-Json -Depth 10 -Compress:$false
+                
+                $newEvent = CreateEvent $organizerEmail $newEventBodyJson
+                
+                if ($null -eq $newEvent)
+                {
+                    Log "    ERROR: Failed to create new series" Red
+                    continue
+                }
+                
+                Log "    Successfully created new series (ID: $($newEvent.id))" Green
+                
+                # Step 3: Handle exceptions after the cutoff date
+                if ($exceptionsAfterCutoff.Count -gt 0)
+                {
+                    Log "    Handling $($exceptionsAfterCutoff.Count) exception occurrence(s)..."
+                    
+                    # For each exception, we need to update it in the new series
+                    # This is complex because we need to find the corresponding occurrence in the new series
+                    # For now, we'll log a warning that manual intervention may be needed
+                    Log "    Warning: Exception occurrences detected. These may need manual review." Yellow
+                    
+                    foreach ($exception in $exceptionsAfterCutoff)
+                    {
+                        Log "      Exception on $($exception.start.dateTime): $($exception.subject)" Yellow
+                    }
+                }
+                
+                Log "    Successfully processed recurring event series (split)" Green
+                continue
+                } # End of split logic (else block for occurrencesBeforeCutoff > 0)
+                
+                # If we reach here, series starts before cutoff but has no occurrences before cutoff
+                # Fall through to standard processing
+            }
+            else
+            {
+                Log "    Series starts on or after cutoff date - will use standard processing" Gray
+            }
+        }
+        
+        # Standard processing for single instance events or series masters that start on/after the cutoff
         # Remove the room mailbox from attendees and send update
         Log "    Removing room from organizer's event attendees list"
         $updatedAttendees = RemoveAttendee $organizerEvent.attendees $roomMailbox
