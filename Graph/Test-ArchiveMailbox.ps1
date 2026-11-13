@@ -30,8 +30,9 @@ auxiliary routing. A run with no redirects does not validate that scenario.
 A unique OutputPath is created for each run. Requests.jsonl records UTC timing,
 HTTP status, URLs, response headers, correlation IDs and response bodies, without
 authorization headers. Results.jsonl records folders, messages and failures.
-Treat these files as mailbox data. -TraceGraphCalls also writes a readable trace
-in that directory. A partial failure is retained and ends with a terminating error.
+Treat these files as mailbox data. -TraceGraphCalls uses TraceInvokeRestMethod
+and its standard script-name .trace file, separate from OutputPath.
+A partial failure is retained and ends with a terminating error.
 Empty folders have no individual message GET to test.
 
 .PREREQUISITES
@@ -134,7 +135,7 @@ param (
     [string]$OutputPath = (Join-Path (Get-Location) ("Test-ArchiveMailbox-{0}-{1}" -f [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ"), [Guid]::NewGuid().ToString("N")))
 )
 
-$script:ScriptVersion = "1.0.2"
+$script:ScriptVersion = "1.0.4"
 if ([string]::IsNullOrWhiteSpace($AppId)) { throw "AppId is required." }
 if ([string]::IsNullOrWhiteSpace($Mailbox)) { throw "Mailbox is required." }
 if ($null -ne $AppSecretKey -and $TenantId -eq "common")
@@ -149,7 +150,6 @@ if ($ConnectionTimeout -le 0) { throw "ConnectionTimeout must be greater than ze
 $OutputPath = (New-Item -Path $OutputPath -ItemType Directory -ErrorAction Stop).FullName
 $script:requestFile = Join-Path $OutputPath "Requests.jsonl"
 $script:resultFile = Join-Path $OutputPath "Results.jsonl"
-$script:archiveTraceFile = Join-Path $OutputPath "Requests.trace"
 
 <# Logging.ps1 %FUNCTIONS_START% #>
 if ($LogToFile) {
@@ -271,13 +271,14 @@ function UpdateHeaders()
     }
 
     # Prepare the request headers
-    if ($null -eq $script:headers -or $script.headers.Count -eq 0)
+    if ($null -eq $script:headers -or $script:headers.Count -eq 0)
     {
         $script:headers = @{
             'Authorization'  = "$($oauth.token_type) $($oauth.access_token)";
             'Content-Type'   = 'application/json';
         }    
     }
+    $script:headers["Authorization"] = "$($oauth.token_type) $($oauth.access_token)"
 }
 
 
@@ -329,13 +330,59 @@ Log "Successfully obtained OAuth token"
 <# Graph.ps1 %FUNCTIONS_START% #>
 
 $script:traceFile = "$($MyInvocation.InvocationName).trace"
-function TraceInvokeRestMethod($method, $url, $body)
+function GetGraphErrorResponse([System.Management.Automation.ErrorRecord]$ErrorRecord)
+{
+    $response = $ErrorRecord.Exception.Response
+    if ($null -eq $response) { return $null }
+    $responseHeaders = @{}
+    if ($response.Headers -is [System.Net.WebHeaderCollection])
+    {
+        foreach ($name in $response.Headers.AllKeys) { $responseHeaders[$name] = $response.Headers[$name] }
+    }
+    else
+    {
+        foreach ($header in $response.Headers.GetEnumerator()) { $responseHeaders[$header.Key] = $header.Value -join ", " }
+    }
+    if ($null -ne $response.Content -and $null -ne $response.Content.Headers)
+    {
+        foreach ($header in $response.Content.Headers.GetEnumerator()) { $responseHeaders[$header.Key] = $header.Value -join ", " }
+    }
+    $content = $ErrorRecord.ErrorDetails.Message
+    if ([string]::IsNullOrEmpty($content))
+    {
+        if ($null -ne $response.Content)
+        {
+            try { $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() }
+            catch { $content = "" }
+        }
+        elseif ($response -is [System.Net.HttpWebResponse])
+        {
+            try
+            {
+                $reader = [System.IO.StreamReader]::new($response.GetResponseStream())
+                try { $content = $reader.ReadToEnd() }
+                finally { $reader.Dispose() }
+            }
+            catch { $content = "" }
+        }
+    }
+    $status = [int]$response.StatusCode
+    $description = $response.ReasonPhrase
+    if ([string]::IsNullOrEmpty($description)) { $description = $response.StatusDescription }
+    $rawContent = "HTTP $status $description`r`n"
+    foreach ($name in $responseHeaders.Keys) { $rawContent += "${name}: $($responseHeaders[$name])`r`n" }
+    $rawContent += "`r`n$content"
+    return [PSCustomObject]@{ StatusCode = $status; Headers = $responseHeaders; Content = $content; RawContent = $rawContent }
+}
+
+# Full responses and caller-managed redirects are opt-in; existing calls still return content.
+function TraceInvokeRestMethod($method, $url, $body, [switch]$ReturnResponse, [switch]$NoRedirect)
 {
     UpdateHeaders
     Write-Verbose "Calling URL: $url"
     if ($TraceGraphCalls)
     {
-        Add-Content -Path $script:traceFile -Value "$method $url"
+        Add-Content -Path $script:traceFile -Value "$method $url" -Encoding UTF8
     }
     try
     {
@@ -346,27 +393,32 @@ function TraceInvokeRestMethod($method, $url, $body)
             Headers = $script:headers
             ContentType = "application/json"
             MaximumRedirection = 0  # Disable automatic redirects so we can handle them manually
+            UseBasicParsing = $true
         }
         if ($PSVersionTable.PSVersion -ge [version]7.4)
         {
             # PowerShell 7.4+ supports ConnectionTimeoutSeconds
             $invokeParameters.ConnectionTimeoutSeconds = $ConnectionTimeout
         }
+        elseif ($ReturnResponse)
+        {
+            $invokeParameters.TimeoutSec = $ConnectionTimeout
+        }
 
         # Write request headers, excluding Authorization
         if ($TraceGraphCalls)
         {
             $invokeParameters.Headers.GetEnumerator() | Where-Object { $_.Key -ne "Authorization" } | ForEach-Object {
-                "$($_.Key): $($_.Value)" | out-file $script:traceFile -Append
+                "$($_.Key): $($_.Value)" | out-file $script:traceFile -Append -Encoding UTF8
             }
-            "Date: $([datetime]::UtcNow.ToString('r'))" | out-file $script:traceFile -Append
+            "Date: $([datetime]::UtcNow.ToString('r'))" | out-file $script:traceFile -Append -Encoding UTF8
         }
 
         if ($method -eq "POST" -or $method -eq "PATCH")
         {            
             if ($TraceGraphCalls)
             {
-                "`r`n$body" | out-file $script:traceFile -Append
+                "`r`n$body" | out-file $script:traceFile -Append -Encoding UTF8
             }
             $invokeParameters.Body = $body
         }
@@ -378,15 +430,29 @@ function TraceInvokeRestMethod($method, $url, $body)
 
         if ($TraceGraphCalls)
         {
-            "" | out-file $script:traceFile -Append
-            $result.RawContent | out-file $script:traceFile -Append
-            "`r`n" | out-file $script:traceFile -Append
+            "" | out-file $script:traceFile -Append -Encoding UTF8
+            $result.RawContent | out-file $script:traceFile -Append -Encoding UTF8
+            "`r`n" | out-file $script:traceFile -Append -Encoding UTF8
         }
     }
     catch
     {
+        if ($ReturnResponse -and ($NoRedirect -or !$_.Exception.Response -or $_.Exception.Response.StatusCode -ne 308))
+        {
+            $errorResponse = GetGraphErrorResponse $_
+            if ($TraceGraphCalls)
+            {
+                "" | out-file $script:traceFile -Append -Encoding UTF8
+                if ($null -ne $errorResponse) { $errorResponse.RawContent | out-file $script:traceFile -Append -Encoding UTF8 }
+                else { $_ | out-file $script:traceFile -Append -Encoding UTF8 }
+                "`r`n" | out-file $script:traceFile -Append -Encoding UTF8
+            }
+            if ($null -ne $errorResponse) { return $errorResponse }
+            throw
+        }
+
         # Check for HTTP 308 Permanent Redirect (archive mailbox redirect)
-        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq 308)
+        if (!$NoRedirect -and $_.Exception.Response -and $_.Exception.Response.StatusCode -eq 308)
         {
             $redirectUrl = $_.Exception.Response.Headers['Location']
             if ($redirectUrl)
@@ -395,15 +461,15 @@ function TraceInvokeRestMethod($method, $url, $body)
                 
                 if ($TraceGraphCalls)
                 {
-                    "" | out-file $script:traceFile -Append
-                    "HTTP 308 Permanent Redirect" | out-file $script:traceFile -Append
-                    "Location: $redirectUrl" | out-file $script:traceFile -Append
-                    "Following redirect..." | out-file $script:traceFile -Append
-                    "`r`n" | out-file $script:traceFile -Append
+                    "" | out-file $script:traceFile -Append -Encoding UTF8
+                    "HTTP 308 Permanent Redirect" | out-file $script:traceFile -Append -Encoding UTF8
+                    "Location: $redirectUrl" | out-file $script:traceFile -Append -Encoding UTF8
+                    "Following redirect..." | out-file $script:traceFile -Append -Encoding UTF8
+                    "`r`n" | out-file $script:traceFile -Append -Encoding UTF8
                 }
                 
                 # Follow the redirect by making a new request
-                return TraceInvokeRestMethod $method $redirectUrl $body
+                return TraceInvokeRestMethod $method $redirectUrl $body -ReturnResponse:$ReturnResponse
             }
         }
         
@@ -413,13 +479,13 @@ function TraceInvokeRestMethod($method, $url, $body)
             if ($result) {
                 # If the result contains raw content, log it to the trace file
                 if ($result.RawContent) {
-                    "" | out-file $script:traceFile -Append
-                    $result.RawContent | out-file $script:traceFile -Append
-                    "`r`n" | out-file $script:traceFile -Append
+                    "" | out-file $script:traceFile -Append -Encoding UTF8
+                    $result.RawContent | out-file $script:traceFile -Append -Encoding UTF8
+                    "`r`n" | out-file $script:traceFile -Append -Encoding UTF8
                 }
                 else {
                     # If raw content is not available, log the entire result object
-                    $result | out-file $script:traceFile -Append
+                    $result | out-file $script:traceFile -Append -Encoding UTF8
                 }                
             }
             else {
@@ -431,9 +497,9 @@ function TraceInvokeRestMethod($method, $url, $body)
                     if ($headers -and $headers.Key.Count -gt 0) {
                         for ($i=0; $i -lt $headers.Key.Count; $i++)
                         {
-                            "$($headers.Key[$i]): $($headers.Value[$i])" | out-file $script:traceFile -Append
+                            "$($headers.Key[$i]): $($headers.Value[$i])" | out-file $script:traceFile -Append -Encoding UTF8
                         }
-                        "" | out-file $script:traceFile -Append
+                        "" | out-file $script:traceFile -Append -Encoding UTF8
                     }
                     else {
                         # Log a message if no response headers are returned
@@ -446,7 +512,7 @@ function TraceInvokeRestMethod($method, $url, $body)
                 }                
             }
             # Log the error object to the trace file
-            $Error[0] | out-file $script:traceFile -Append
+            $Error[0] | out-file $script:traceFile -Append -Encoding UTF8
         }
         Log "$method failed to URL: $url" Red
         if ($Error[0].ErrorDetails.Message)
@@ -463,11 +529,111 @@ function TraceInvokeRestMethod($method, $url, $body)
         }
         return $null
     }
+    if ($ReturnResponse) { return $result }
     return $result.Content
 }
 
-function GET($url)
+function ResolveGraphRequestUrl([string]$Url, [string]$BaseUrl, [scriptblock]$ValidateUrl)
 {
+    $target = $null
+    if (![Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$target))
+    {
+        if ([string]::IsNullOrEmpty($BaseUrl)) { throw "An absolute Graph URL is required." }
+        $target = [Uri]::new([Uri]$BaseUrl, $Url)
+    }
+    if ($target.Scheme -ne "https" -or $target.Host -ne "graph.microsoft.com" -or
+        !$target.IsDefaultPort -or $target.UserInfo -or $target.Fragment)
+    {
+        throw "Rejected an unsafe Graph redirect or pagination URL."
+    }
+    if ($null -ne $ValidateUrl) { $null = & $ValidateUrl $target.AbsoluteUri }
+    return $target.AbsoluteUri
+}
+
+# RequestOptions enables strict JSON responses, bounded redirects and per-response observation.
+# Supported keys: MaxRedirects, ValidateUrl, OnResponse, OnRedirect.
+# ValidateUrl must throw to reject a URL.
+function InvokeGraphRequest([string]$method, [string]$url, [object]$body, [hashtable]$RequestOptions)
+{
+    if ($null -eq $RequestOptions) { $RequestOptions = @{} }
+    $redirectLimit = 10
+    if ($RequestOptions.ContainsKey("MaxRedirects")) { $redirectLimit = [int]$RequestOptions.MaxRedirects }
+    if ($redirectLimit -lt 0 -or $redirectLimit -gt 50) { throw "MaxRedirects must be between 0 and 50." }
+    $urlToGet = ResolveGraphRequestUrl $url -ValidateUrl $RequestOptions.ValidateUrl
+    $initialUrl = $urlToGet
+    $visited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($hop = 0; $hop -le $redirectLimit; $hop++)
+    {
+        if (!$visited.Add($urlToGet)) { throw "Graph redirect loop at $urlToGet" }
+        $clientRequestId = [Guid]::NewGuid().ToString()
+        $started = [DateTime]::UtcNow
+        $response = $null
+        $responseHeaders = @{}
+        $transportError = $null
+        try
+        {
+            if ($null -eq $script:headers) { $script:headers = @{ "Content-Type" = "application/json" } }
+            $script:headers["client-request-id"] = $clientRequestId
+            $script:headers["return-client-request-id"] = "true"
+            $response = TraceInvokeRestMethod $method $urlToGet $body -ReturnResponse -NoRedirect
+            foreach ($name in $response.Headers.Keys) { $responseHeaders[$name] = $response.Headers[$name] -join ", " }
+        }
+        catch { $transportError = $_.Exception.Message }
+        $record = [PSCustomObject]@{
+            StartedUtc = $started.ToString("o")
+            FinishedUtc = [DateTime]::UtcNow.ToString("o")
+            Method = $method
+            Url = $urlToGet
+            ClientRequestId = $clientRequestId
+            Status = $(if ($null -ne $response) { [int]$response.StatusCode } else { $null })
+            Headers = $(if ($null -ne $response) { $responseHeaders } else { $null })
+            Body = $(if ($null -ne $response) { [string]$response.Content } else { $null })
+            TransportError = $transportError
+        }
+        if ($null -ne $RequestOptions.OnResponse) { $null = & $RequestOptions.OnResponse $record }
+        if ($transportError) { throw "Transport failure for ${urlToGet}: $transportError" }
+        $data = $null
+        if ($record.Status -ne 308 -and ![string]::IsNullOrWhiteSpace($record.Body))
+        {
+            try { $data = ConvertFrom-Json -InputObject $record.Body -ErrorAction Stop }
+            catch { throw "HTTP $($record.Status) returned invalid JSON at $urlToGet." }
+        }
+        $redirect = $null
+        if ($record.Status -eq 308)
+        {
+            $redirect = $responseHeaders["Location"]
+            if ([string]::IsNullOrWhiteSpace($redirect)) { throw "HTTP 308 without a Location header at $urlToGet" }
+        }
+        elseif ($data.error.code -eq "ErrorArchiveFolderMovedPermanently")
+        {
+            $redirect = $data.error.message
+            if ([string]::IsNullOrWhiteSpace($redirect)) { throw "Archive-moved error without a redirect URL at $urlToGet" }
+        }
+        if ($redirect)
+        {
+            $nextUrl = ResolveGraphRequestUrl $redirect $urlToGet -ValidateUrl $RequestOptions.ValidateUrl
+            if ($hop -ge $redirectLimit) { throw "Exceeded MaxRedirects ($redirectLimit) for $initialUrl" }
+            if ($visited.Contains($nextUrl)) { throw "Graph redirect loop at $nextUrl" }
+            if ($null -ne $RequestOptions.OnRedirect) { $null = & $RequestOptions.OnRedirect $urlToGet $nextUrl }
+            LogVerbose "Following Graph redirect: $urlToGet -> $nextUrl"
+            $urlToGet = $nextUrl
+            continue
+        }
+        if ($record.Status -lt 200 -or $record.Status -ge 300 -or $null -ne $data.error -or
+            ($record.Status -eq 200 -and $null -eq $data))
+        {
+            throw "$method failed: HTTP $($record.Status), code '$($data.error.code)', URL $urlToGet."
+        }
+        return [PSCustomObject]@{
+            Data = $data; Url = $urlToGet; RequestUrl = $initialUrl
+            Status = $record.Status; Headers = $responseHeaders; Body = $record.Body
+        }
+    }
+}
+
+function GET($url, [hashtable]$RequestOptions)
+{
+    if ($null -ne $RequestOptions) { return InvokeGraphRequest "GET" $url $null $RequestOptions }
     Write-Verbose "Calling URL: $url"
     try
     {
@@ -536,19 +702,124 @@ function rawGET($url)
 
 <# Graph.ps1 %FUNCTIONS_END% #>
 
+<# Mailbox.ps1 %FUNCTIONS_START% #>
+# RequestOptions returns routed response metadata; omitting it retains parsed JSON results.
+function GetMailboxFolder($queryString, [string]$BaseUrl = $script:graphBaseUrl, [hashtable]$RequestOptions,
+    [string]$FolderId, [switch]$ChildFolders)
+{
+    $url = $BaseUrl.TrimEnd('/') + "/mailFolders"
+    if (![string]::IsNullOrEmpty($FolderId)) { $url += "/" + [Uri]::EscapeDataString($FolderId) }
+    if ($ChildFolders)
+    {
+        if ([string]::IsNullOrEmpty($FolderId)) { throw "FolderId is required when listing child folders." }
+        $url += "/childFolders"
+    }
+    $url += $queryString
+    if ($null -ne $RequestOptions) { return GET $url -RequestOptions $RequestOptions }
+    $response = GET $url
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function GetFolderMessages($folderId, $queryString, [string]$BaseUrl = $script:graphBaseUrl, [hashtable]$RequestOptions)
+{
+    if ($null -ne $RequestOptions) { $folderId = [Uri]::EscapeDataString($folderId) }
+    $url = $BaseUrl.TrimEnd('/') + "/mailFolders/$folderId/messages$queryString"
+    if ($null -ne $RequestOptions) { return GET $url -RequestOptions $RequestOptions }
+    $response = GET $url
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function GetMessages($queryString)
+{
+    $url = $script:graphBaseUrl + "messages$queryString"
+    $response = GET $url
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function GetFolderMessageById($folderId, $messageId, $queryString, [string]$BaseUrl = $script:graphBaseUrl, [hashtable]$RequestOptions)
+{
+    if ($null -ne $RequestOptions)
+    {
+        $folderId = [Uri]::EscapeDataString($folderId)
+        $messageId = [Uri]::EscapeDataString($messageId)
+    }
+    $url = $BaseUrl.TrimEnd('/') + "/mailFolders/$folderId/messages/$messageId$queryString"
+    if ($null -ne $RequestOptions) { return GET $url -RequestOptions $RequestOptions }
+    $response = GET $url
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function GetFolderMessageByIdAttachments($folderId, $messageId)
+{
+    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId/attachments"
+    $response = GET $url
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function DeleteFolderMessageById($folderId, $messageId)
+{
+    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId"
+    $response = DELETE $url
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return $response
+}
+
+function CreateMailboxFolder($parentFolderId, $folderName)
+{
+    $url = $script:graphBaseUrl + "mailFolders/$parentFolderId/childFolders"
+    $body = @{
+        displayName = $folderName
+    } | ConvertTo-Json
+    $response = POST $url $body
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+function CopyMessageToFolder($messageId, $destinationFolderId)
+{
+    $url = $script:graphBaseUrl + "messages/$messageId/copy"
+    $body = @{
+        destinationId = $destinationFolderId
+    } | ConvertTo-Json
+    $response = POST $url $body
+    if ($null -eq $response)
+    {
+        return $null
+    }
+    return ConvertFrom-Json ($response)
+}
+
+<# Mailbox.ps1 %FUNCTIONS_END% #>
+
 function Resolve-ArchiveUrl([string]$Url, [string]$BaseUrl)
 {
-    $target = $null
-    if (![Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$target))
-    {
-        if ([string]::IsNullOrEmpty($BaseUrl)) { throw "An absolute Graph URL is required." }
-        $target = [Uri]::new([Uri]$BaseUrl, $Url)
-    }
-    if ($target.Scheme -ne "https" -or $target.Host -ne "graph.microsoft.com" -or
-        !$target.IsDefaultPort -or $target.UserInfo -or $target.Fragment)
-    {
-        throw "Rejected an unsafe Graph redirect or pagination URL."
-    }
+    $target = [Uri](ResolveGraphRequestUrl $Url $BaseUrl)
     if ($target.AbsoluteUri -ceq $script:archiveDiscoveryUrl) { return $target.AbsoluteUri }
     $path = [Uri]::UnescapeDataString($target.AbsolutePath)
     $tenantPattern = [Regex]::Escape([string]$script:archiveTenant)
@@ -560,116 +831,49 @@ function Resolve-ArchiveUrl([string]$Url, [string]$BaseUrl)
     return $target.AbsoluteUri
 }
 
-# Unlike the shared GET helper, this transport retains status and bounds redirects.
-function Send-ArchiveHttpGet([string]$Url, [string]$ClientRequestId)
+function New-ArchiveRequestOptions
 {
-    UpdateHeaders
-    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
-    $response = $null
-    try
-    {
-        $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new($script:oauth.token_type, $script:oauth.access_token)
-        $request.Headers.Add("client-request-id", $ClientRequestId)
-        $request.Headers.Add("return-client-request-id", "true")
-        $response = $script:archiveClient.SendAsync($request).GetAwaiter().GetResult()
-        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-        $responseHeaders = @{}
-        foreach ($header in $response.Headers) { $responseHeaders[$header.Key] = $header.Value -join ", " }
-        foreach ($header in $response.Content.Headers) { $responseHeaders[$header.Key] = $header.Value -join ", " }
-        return [PSCustomObject]@{ Status = [int]$response.StatusCode; Headers = $responseHeaders; Body = $body }
-    }
-    finally
-    {
-        if ($null -ne $response) { $response.Dispose() }
-        $request.Dispose()
-    }
-}
-
-function Invoke-ArchiveGet([string]$Url)
-{
-    $visited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $urlToGet = Resolve-ArchiveUrl $Url
-    for ($hop = 0; $hop -le $MaxRedirects; $hop++)
-    {
-        if (!$visited.Add($urlToGet)) { throw "Archive redirect loop at $urlToGet" }
-        $clientRequestId = [Guid]::NewGuid().ToString()
-        $started = [DateTime]::UtcNow
-        $response = $null
-        $transportError = $null
-        try { $response = Send-ArchiveHttpGet $urlToGet $clientRequestId }
-        catch { $transportError = $_.Exception.Message }
-        $record = [PSCustomObject]@{
-            StartedUtc = $started.ToString("o")
-            FinishedUtc = [DateTime]::UtcNow.ToString("o")
-            Method = "GET"
-            Url = $urlToGet
-            ClientRequestId = $clientRequestId
-            Status = $(if ($null -ne $response) { $response.Status } else { $null })
-            Headers = $(if ($null -ne $response) { $response.Headers } else { $null })
-            Body = $(if ($null -ne $response) { $response.Body } else { $null })
-            TransportError = $transportError
+    return @{
+        MaxRedirects = $MaxRedirects
+        ValidateUrl = { param([string]$Url) Resolve-ArchiveUrl $Url }
+        OnResponse = {
+            param([object]$Record)
+            $Record | ConvertTo-Json -Depth 20 -Compress | Add-Content -LiteralPath $script:requestFile -Encoding UTF8 -ErrorAction Stop
         }
-        $record | ConvertTo-Json -Depth 20 -Compress | Add-Content -LiteralPath $script:requestFile -Encoding UTF8 -ErrorAction Stop
-        if ($TraceGraphCalls)
-        {
-            $record | Format-List | Out-String -Width 4096 | Add-Content -LiteralPath $script:archiveTraceFile -Encoding UTF8 -ErrorAction Stop
-        }
-        if ($transportError) { throw "Transport failure for ${urlToGet}: $transportError" }
-        $data = $null
-        if ($response.Status -ne 308 -and ![string]::IsNullOrWhiteSpace($response.Body))
-        {
-            try { $data = ConvertFrom-Json -InputObject $response.Body -ErrorAction Stop }
-            catch { throw "HTTP $($response.Status) returned invalid JSON at $urlToGet; see Requests.jsonl." }
-        }
-        $redirect = $null
-        if ($response.Status -eq 308)
-        {
-            $redirect = $response.Headers["Location"]
-            if ([string]::IsNullOrWhiteSpace($redirect)) { throw "HTTP 308 without a Location header at $urlToGet" }
-        }
-        elseif ($data.error.code -eq "ErrorArchiveFolderMovedPermanently")
-        {
-            $redirect = $data.error.message
-            if ([string]::IsNullOrWhiteSpace($redirect)) { throw "Archive-moved error without a redirect URL at $urlToGet" }
-        }
-        if ($redirect)
-        {
+        OnRedirect = {
+            param([string]$From, [string]$To)
             $script:archiveRedirectCount++
-            Log "Archive redirect: $urlToGet -> $redirect" Yellow
-            $urlToGet = Resolve-ArchiveUrl $redirect $urlToGet
-            continue
+            Log "Archive redirect: $From -> $To" Yellow
         }
-        if ($response.Status -ne 200 -or $null -eq $data -or $null -ne $data.error)
-        {
-            throw "GET failed: HTTP $($response.Status), code '$($data.error.code)', URL $urlToGet; see Requests.jsonl."
-        }
-        return [PSCustomObject]@{ Data = $data; Url = $urlToGet }
     }
-    throw "Exceeded MaxRedirects ($MaxRedirects) for $Url"
 }
 
-function Get-ArchiveCollection([string]$Url, [int]$Limit = [int]::MaxValue)
+function Get-ArchiveCollection([scriptblock]$ReadFirstPage, [int]$Limit = [int]::MaxValue)
 {
+    if ($Limit -le 0) { return }
     $seenPages = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $count = 0
-    while ($Url -and $count -lt $Limit)
+    $page = & $ReadFirstPage
+    while ($null -ne $page -and $count -lt $Limit)
     {
-        $Url = Resolve-ArchiveUrl $Url
-        if (!$seenPages.Add($Url)) { throw "Repeated archive pagination link: $Url" }
-        $page = Invoke-ArchiveGet $Url
+        if (!$seenPages.Add($page.Url)) { throw "Repeated archive pagination link: $($page.Url)" }
+        if ($page.RequestUrl) { $null = $seenPages.Add($page.RequestUrl) }
         if ($null -eq $page.Data.PSObject.Properties["value"] -or $null -eq $page.Data.value -or $page.Data.value -isnot [array])
         {
-            throw "Expected a Graph collection at $Url"
+            throw "Expected a Graph collection at $($page.Url)"
         }
         foreach ($entry in $page.Data.value)
         {
-            if ([string]::IsNullOrWhiteSpace($entry.id)) { throw "Collection entry without an ID at $Url" }
+            if ([string]::IsNullOrWhiteSpace($entry.id)) { throw "Collection entry without an ID at $($page.Url)" }
             $entry
             $count++
             if ($count -ge $Limit) { break }
         }
-        $Url = $page.Data.'@odata.nextLink'
-        if ($Url -and $count -lt $Limit) { $Url = Resolve-ArchiveUrl $Url $page.Url }
+        $nextLink = $page.Data.'@odata.nextLink'
+        if (!$nextLink -or $count -ge $Limit) { break }
+        $nextUrl = Resolve-ArchiveUrl $nextLink $page.Url
+        if ($seenPages.Contains($nextUrl)) { throw "Repeated archive pagination link: $nextUrl" }
+        $page = GET $nextUrl -RequestOptions $script:archiveRequestOptions
     }
 }
 
@@ -704,7 +908,7 @@ function Initialize-ArchiveMailbox
 {
     $script:archiveMailboxId = $null
     $script:archiveTenant = $null
-    $settings = (Invoke-ArchiveGet $script:archiveDiscoveryUrl).Data
+    $settings = (GET $script:archiveDiscoveryUrl -RequestOptions $script:archiveRequestOptions).Data
     if ($null -eq $settings.PSObject.Properties["inPlaceArchiveMailboxId"])
     {
         throw "Exchange settings did not return inPlaceArchiveMailboxId for $Mailbox; archive discovery is unavailable in this response."
@@ -746,7 +950,10 @@ function Initialize-ArchiveMailbox
 function Test-ArchiveFolders
 {
     if ([string]::IsNullOrEmpty($script:archiveMailboxId)) { throw "Discover the archive mailbox before listing folders." }
-    $baseUrl = "https://graph.microsoft.com/$ApiVersion/users/$script:archiveMailboxId/mailFolders"
+    $mailboxRequest = @{
+        BaseUrl = "https://graph.microsoft.com/$ApiVersion/users/$script:archiveMailboxId/"
+        RequestOptions = $script:archiveRequestOptions
+    }
     $hiddenQuery = "?includeHiddenFolders=$($IncludeHiddenFolders.IsPresent.ToString().ToLowerInvariant())"
     $folderSelect = '&$select=id,displayName,parentFolderId,childFolderCount,totalItemCount'
     $messageQuery = '?$select=id,subject,receivedDateTime,parentFolderId&$top=' + $ItemsPerFolder
@@ -755,14 +962,13 @@ function Test-ArchiveFolders
     # Enqueue as pages arrive so already discovered folders survive a later page failure.
     try
     {
-        Get-ArchiveCollection "$baseUrl$hiddenQuery$folderSelect" | ForEach-Object { $queue.Enqueue($_) }
+        Get-ArchiveCollection { GetMailboxFolder "$hiddenQuery$folderSelect" @mailboxRequest } | ForEach-Object { $queue.Enqueue($_) }
     }
     catch { Write-ArchiveFailure "ListFolders" $script:archiveMailboxId $_.Exception.Message }
     while ($queue.Count -gt 0)
     {
         $folder = $queue.Dequeue()
         if (!$seenFolders.Add($folder.id)) { continue }
-        $folderUrl = "$baseUrl/$([Uri]::EscapeDataString($folder.id))"
         $script:archiveFolderCount++
         Write-ArchiveResult ([PSCustomObject]@{
             Kind = "Folder"; Id = $folder.id; DisplayName = $folder.displayName
@@ -770,7 +976,7 @@ function Test-ArchiveFolders
         })
         try
         {
-            $getFolder = Invoke-ArchiveGet ($folderUrl + '?$select=id,displayName,parentFolderId,childFolderCount,totalItemCount')
+            $getFolder = GetMailboxFolder '?$select=id,displayName,parentFolderId,childFolderCount,totalItemCount' -FolderId $folder.id @mailboxRequest
             Assert-ArchiveResourceId $getFolder "mailFolders"
             $null = $seenFolders.Add($getFolder.Data.id)
         }
@@ -778,7 +984,7 @@ function Test-ArchiveFolders
         # Start each operation through the main archive to independently test its routing.
         try
         {
-            Get-ArchiveCollection "$folderUrl/messages$messageQuery" -Limit $ItemsPerFolder | ForEach-Object {
+            Get-ArchiveCollection { GetFolderMessages $folder.id $messageQuery @mailboxRequest } -Limit $ItemsPerFolder | ForEach-Object {
                 $message = $_
                 $script:archiveMessageCount++
                 Write-ArchiveResult ([PSCustomObject]@{
@@ -787,8 +993,7 @@ function Test-ArchiveFolders
                 })
                 try
                 {
-                    $messageUrl = "$folderUrl/messages/$([Uri]::EscapeDataString($message.id))" + '?$select=id,subject,receivedDateTime,parentFolderId'
-                    $getMessage = Invoke-ArchiveGet $messageUrl
+                    $getMessage = GetFolderMessageById $folder.id $message.id '?$select=id,subject,receivedDateTime,parentFolderId' @mailboxRequest
                     Assert-ArchiveResourceId $getMessage "messages"
                 }
                 catch { Write-ArchiveFailure "GetMessage" $message.id $_.Exception.Message }
@@ -797,41 +1002,31 @@ function Test-ArchiveFolders
         catch { Write-ArchiveFailure "ListMessages" $folder.id $_.Exception.Message }
         try
         {
-            Get-ArchiveCollection "$folderUrl/childFolders$hiddenQuery$folderSelect" | ForEach-Object { $queue.Enqueue($_) }
+            Get-ArchiveCollection { GetMailboxFolder "$hiddenQuery$folderSelect" -FolderId $folder.id -ChildFolders @mailboxRequest } | ForEach-Object { $queue.Enqueue($_) }
         }
         catch { Write-ArchiveFailure "ListChildFolders" $folder.id $_.Exception.Message }
     }
 }
 
-Add-Type -AssemblyName System.Net.Http
-$handler = [System.Net.Http.HttpClientHandler]::new()
-$handler.AllowAutoRedirect = $false
-$script:archiveClient = [System.Net.Http.HttpClient]::new($handler)
-$script:archiveClient.Timeout = [TimeSpan]::FromSeconds($ConnectionTimeout)
+# Main code
 $script:archiveRedirectCount = 0
 $script:archiveFailureCount = 0
 $script:archiveFolderCount = 0
 $script:archiveMessageCount = 0
-try
+$script:archiveRequestOptions = New-ArchiveRequestOptions
+Log "Discovering the archive for $Mailbox; evidence: $OutputPath"
+try { Initialize-ArchiveMailbox }
+catch
 {
-    Log "Discovering the archive for $Mailbox; evidence: $OutputPath"
-    try { Initialize-ArchiveMailbox }
-    catch
-    {
-        Write-ArchiveFailure "DiscoverArchive" $Mailbox $_.Exception.Message
-        throw
-    }
-    Log "Testing discovered archive $script:archiveMailboxId ($ApiVersion)"
-    Test-ArchiveFolders
-    Write-ArchiveResult ([PSCustomObject]@{
-        Kind = "Summary"; Folders = $script:archiveFolderCount; Messages = $script:archiveMessageCount
-        Redirects = $script:archiveRedirectCount; Failures = $script:archiveFailureCount
-        AuxiliaryRouting = $(if ($script:archiveRedirectCount -gt 0) { "Redirects observed; inspect Requests.jsonl for target mailboxes." } else { "Not exercised: no archive redirects observed." })
-    })
-    if ($script:archiveFailureCount -gt 0) { throw "$($script:archiveFailureCount) archive operation(s) failed; see $OutputPath" }
-    Log "Completed"
+    Write-ArchiveFailure "DiscoverArchive" $Mailbox $_.Exception.Message
+    throw
 }
-finally
-{
-    $script:archiveClient.Dispose()
-}
+Log "Testing discovered archive $script:archiveMailboxId ($ApiVersion)"
+Test-ArchiveFolders
+Write-ArchiveResult ([PSCustomObject]@{
+    Kind = "Summary"; Folders = $script:archiveFolderCount; Messages = $script:archiveMessageCount
+    Redirects = $script:archiveRedirectCount; Failures = $script:archiveFailureCount
+    AuxiliaryRouting = $(if ($script:archiveRedirectCount -gt 0) { "Redirects observed; inspect Requests.jsonl for target mailboxes." } else { "Not exercised: no archive redirects observed." })
+})
+if ($script:archiveFailureCount -gt 0) { throw "$($script:archiveFailureCount) archive operation(s) failed; see $OutputPath" }
+Log "Completed"

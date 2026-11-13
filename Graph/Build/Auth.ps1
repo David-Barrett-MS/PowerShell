@@ -29,9 +29,17 @@ param (
     [ValidateNotNullOrEmpty()]
     [string]$AppId,
 
-    [Parameter(Mandatory=$False,HelpMessage="Application secret key (obtained when registering the application in Azure AD).  If not specified, delegate permissions are assumed.")]
+    [Parameter(Mandatory=$False,HelpMessage="Application secret key as a String or SecureString (obtained when registering the application in Azure AD). If not specified, delegate permissions are assumed.")]
     [ValidateNotNullOrEmpty()]
-    [string]$AppSecretKey,
+    [ValidateScript({
+        if ($_ -isnot [string] -and $_ -isnot [System.Security.SecureString])
+        {
+            throw "AppSecretKey must be a String or SecureString."
+        }
+        if ($_.Length -eq 0) { throw "AppSecretKey must not be empty." }
+        return $true
+    })]
+    [object]$AppSecretKey,
 
     [Parameter(Mandatory=$False,HelpMessage="Redirect Url (specified when registering the application in Azure AD, use localhost).  Required for delegate permissions.")]
     [ValidateNotNullOrEmpty()]
@@ -56,12 +64,33 @@ param (
 
 
 <# Auth.ps1 %FUNCTIONS_START% #>
+function GetAppSecretKeyValue([object]$Secret)
+{
+    if ($Secret -is [string] -and $Secret.Length -gt 0) { return $Secret }
+    if ($Secret -isnot [System.Security.SecureString] -or $Secret.Length -eq 0)
+    {
+        throw "AppSecretKey must be a nonempty String or SecureString."
+    }
+
+    $secretPointer = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+    try
+    {
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($secretPointer)
+    }
+    finally
+    {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secretPointer)
+    }
+}
+
 function GetAppAuthToken()
 {
     # Acquire token for application permissions
-    $body = @{grant_type="client_credentials";scope="https://graph.microsoft.com/.default";client_id=$AppId;client_secret=$AppSecretKey}
+    $body = @{grant_type="client_credentials";scope="https://graph.microsoft.com/.default";client_id=$AppId}
     try
     {
+        # Convert only at the token request boundary; never replace the caller's secret.
+        $body.client_secret = GetAppSecretKeyValue $AppSecretKey
         $script:oauth = Invoke-RestMethod -Method Post -Uri https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token -Body $body
         $script:token_expires = (Get-Date).AddSeconds($oauth.expires_in)
     }
@@ -71,6 +100,10 @@ function GetAppAuthToken()
         $Error[0]
         exit # Failed to obtain a token
     }
+    finally
+    {
+        $body.Remove("client_secret")
+    }
     $script:graphBaseUrl = "https://graph.microsoft.com/v1.0/users/$User/"
 }
 
@@ -78,7 +111,7 @@ function RenewOAuthToken()
 {
     # If using app flow, we just obtain a new token
 
-    if (![String]::IsNullOrEmpty($AppSecretKey))
+    if ($null -ne $AppSecretKey)
     {
         GetAppAuthToken
         return
@@ -108,20 +141,21 @@ function UpdateHeaders()
     }
 
     # Prepare the request headers
-    if ($null -eq $script:headers -or $script.headers.Count -eq 0)
+    if ($null -eq $script:headers -or $script:headers.Count -eq 0)
     {
         $script:headers = @{
             'Authorization'  = "$($oauth.token_type) $($oauth.access_token)";
             'Content-Type'   = 'application/json';
         }    
     }
+    $script:headers["Authorization"] = "$($oauth.token_type) $($oauth.access_token)"
 }
 
 
 
 ## Authentication
 
-if ([String]::IsNullOrEmpty($AppSecretKey))
+if ($null -eq $AppSecretKey)
 {
     # Acquire auth code (needed to request token)
     $authUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/authorize?client_id=$AppId&response_type=code&redirect_uri=$RedirectUrl&response_mode=query&scope=openid%20profile%20email%20offline_access%20"

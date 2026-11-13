@@ -36,9 +36,19 @@ param (
 
 
 <# Mailbox.ps1 %FUNCTIONS_START% #>
-function GetMailboxFolder($queryString)
+# RequestOptions returns routed response metadata; omitting it retains parsed JSON results.
+function GetMailboxFolder($queryString, [string]$BaseUrl = $script:graphBaseUrl, [hashtable]$RequestOptions,
+    [string]$FolderId, [switch]$ChildFolders)
 {
-    $url = $script:graphBaseUrl + "mailFolders$queryString"
+    $url = $BaseUrl.TrimEnd('/') + "/mailFolders"
+    if (![string]::IsNullOrEmpty($FolderId)) { $url += "/" + [Uri]::EscapeDataString($FolderId) }
+    if ($ChildFolders)
+    {
+        if ([string]::IsNullOrEmpty($FolderId)) { throw "FolderId is required when listing child folders." }
+        $url += "/childFolders"
+    }
+    $url += $queryString
+    if ($null -ne $RequestOptions) { return GET $url -RequestOptions $RequestOptions }
     $response = GET $url
     if ($null -eq $response)
     {
@@ -47,9 +57,11 @@ function GetMailboxFolder($queryString)
     return ConvertFrom-Json ($response)
 }
 
-function GetFolderMessages($folderId, $queryString)
+function GetFolderMessages($folderId, $queryString, [string]$BaseUrl = $script:graphBaseUrl, [hashtable]$RequestOptions)
 {
-    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages$queryString"
+    if ($null -ne $RequestOptions) { $folderId = [Uri]::EscapeDataString($folderId) }
+    $url = $BaseUrl.TrimEnd('/') + "/mailFolders/$folderId/messages$queryString"
+    if ($null -ne $RequestOptions) { return GET $url -RequestOptions $RequestOptions }
     $response = GET $url
     if ($null -eq $response)
     {
@@ -65,18 +77,24 @@ function GetMessages($queryString)
     if ($null -eq $response)
     {
         return $null
-    }    
+    }
     return ConvertFrom-Json ($response)
 }
 
-function GetFolderMessageById($folderId, $messageId, $queryString)
+function GetFolderMessageById($folderId, $messageId, $queryString, [string]$BaseUrl = $script:graphBaseUrl, [hashtable]$RequestOptions)
 {
-    $url = $script:graphBaseUrl + "mailFolders/$folderId/messages/$messageId$queryString"
+    if ($null -ne $RequestOptions)
+    {
+        $folderId = [Uri]::EscapeDataString($folderId)
+        $messageId = [Uri]::EscapeDataString($messageId)
+    }
+    $url = $BaseUrl.TrimEnd('/') + "/mailFolders/$folderId/messages/$messageId$queryString"
+    if ($null -ne $RequestOptions) { return GET $url -RequestOptions $RequestOptions }
     $response = GET $url
     if ($null -eq $response)
     {
         return $null
-    }    
+    }
     return ConvertFrom-Json ($response)
 }
 
@@ -87,7 +105,7 @@ function GetFolderMessageByIdAttachments($folderId, $messageId)
     if ($null -eq $response)
     {
         return $null
-    }    
+    }
     return ConvertFrom-Json ($response)
 }
 
@@ -98,7 +116,7 @@ function DeleteFolderMessageById($folderId, $messageId)
     if ($null -eq $response)
     {
         return $null
-    }    
+    }
     return $response
 }
 
