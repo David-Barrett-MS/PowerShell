@@ -21,7 +21,7 @@ This script demonstrates how to create a draft message and add large attachments
 https://docs.microsoft.com/en-us/graph/api/attachment-createuploadsession
 
 .EXAMPLE
-.\createUploadSession.ps1 -AppId "<AppId>" -TenantId "<TenantId>" -AppSecretKey "<AppSecretKey>" -Mailbox "<mailbox>"
+.\createUploadSession.ps1 -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -Mailbox $Mailbox -FileAttachments $Attachments
 
 #>
 
@@ -44,9 +44,13 @@ param (
 
 	[Parameter(Mandatory=$False,HelpMessage="The file(s) that will be attached.")]
 	[ValidateNotNullOrEmpty()]
-    $FileAttachments
+    $FileAttachments,
+
+	[Parameter(Mandatory=$False,HelpMessage="Block size for uploading attachments (should be 3Mb).")]
+    $BlockSize = 3Mb
+
 )
-$script:ScriptVersion = "1.0.2"
+$script:ScriptVersion = "1.0.4"
 
 $graphUrl = "https://graph.microsoft.com/v1.0/users/$Mailbox/"
 
@@ -153,12 +157,14 @@ foreach ($filePath in $FileAttachments)
 
 
     $offset = 0
-    $blockSize = 3Mb
+    $part = 1
 
+    Write-Host "Uploading to: $($createUploadSessionResults.uploadUrl)" -ForegroundColor White
+    Write-Host "Uploading part" -ForegroundColor White -NoNewline
     while ($offset -lt $attachmentFile.Length)
     {
         # Read the next block of data from the file
-        $blockBytes = $fileReader.ReadBytes($blockSize)
+        $blockBytes = $fileReader.ReadBytes($BlockSize)
 
         # Prepare the request headers
         $headers = @{
@@ -174,7 +180,7 @@ foreach ($filePath in $FileAttachments)
         # Upload the data
         try
         {
-            Write-Host "Uploading to: $($createUploadSessionResults.uploadUrl)" -ForegroundColor White
+            Write-Host " $part" -ForegroundColor White -NoNewline
             # We're not interested in the uploadResults here, but we assign it to a global variable for easier troubleshooting
             if ($PSVersionTable.PSVersion.Major -lt 7)
             {
@@ -184,6 +190,7 @@ foreach ($filePath in $FileAttachments)
             {
                 $global:uploadResults = Invoke-WebRequest -Method Put -Uri $createUploadSessionResults.uploadUrl -Body $blockBytes -Headers $headers -ContentType "application/octet-stream" -SkipHeaderValidation
             }
+            $part++
         }
         catch
         {
@@ -193,6 +200,7 @@ foreach ($filePath in $FileAttachments)
             exit 
         }
     }
+    Write-Host
     Write-Host "Finished uploading: $filePath"
 
 
