@@ -83,9 +83,15 @@ param (
     [ValidateNotNullOrEmpty()]
     [string]$SourceMailbox = "",
 
+    [Parameter(Mandatory=$False,HelpMessage="Source mailbox is archive mailbox (not primary).")]
+    [switch]$SourceArchive,
+
     [Parameter(Mandatory=$False,HelpMessage="Target mailbox (required if importing items to another mailbox or from file system).")]
     [ValidateNotNullOrEmpty()]
     [string]$TargetMailbox = "",
+
+    [Parameter(Mandatory=$False,HelpMessage="Target mailbox is archive mailbox (not primary).")]
+    [switch]$TargetArchive,
 
     [Parameter(Mandatory=$False,HelpMessage="If specified, folders will be created in the target mailbox if they do not exist.")]
     [switch]$CreateFolders,
@@ -125,7 +131,7 @@ param (
 
 )
 
-$script:ScriptVersion = "1.0.3"
+$script:ScriptVersion = "1.0.4"
 $scriptStartTime = [DateTime]::Now
 
 # Parameter validation
@@ -315,6 +321,7 @@ function TraceInvokeRestMethod($method, $url, $body)
             Uri = $url
             Headers = $script:headers
             ContentType = "application/json"
+            MaximumRedirection = 0  # Disable automatic redirects so we can handle them manually
         }
         if ($PSVersionTable.PSVersion -ge [version]7.4)
         {
@@ -354,6 +361,28 @@ function TraceInvokeRestMethod($method, $url, $body)
     }
     catch
     {
+        # Check for HTTP 308 Permanent Redirect (archive mailbox redirect)
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq 308)
+        {
+            $redirectUrl = $_.Exception.Response.Headers['Location']
+            if ($redirectUrl)
+            {
+                LogVerbose "Received HTTP 308 redirect to: $redirectUrl"
+                
+                if ($TraceGraphCalls)
+                {
+                    "" | out-file $script:traceFile -Append
+                    "HTTP 308 Permanent Redirect" | out-file $script:traceFile -Append
+                    "Location: $redirectUrl" | out-file $script:traceFile -Append
+                    "Following redirect..." | out-file $script:traceFile -Append
+                    "`r`n" | out-file $script:traceFile -Append
+                }
+                
+                # Follow the redirect by making a new request
+                return TraceInvokeRestMethod $method $redirectUrl $body
+            }
+        }
+        
         if ($TraceGraphCalls)
         {
             # Check if there is a result object
@@ -1043,6 +1072,37 @@ function ExportItem($folderId, $itemId)
         return $null
     }
     
+    # Check for archive mailbox redirect (ErrorArchiveFolderMovedPermanently)
+    $exportDataObj = $exportData | ConvertFrom-Json
+    if ($exportDataObj.value -and $exportDataObj.value.Count -gt 0)
+    {
+        $item = $exportDataObj.value[0]
+        if ($item.Error -and $item.Error.code -eq "ErrorArchiveFolderMovedPermanently")
+        {
+            # Item is in an auxiliary archive mailbox, retry with redirect URL
+            $redirectUrl = $item.Error.message
+            if (![String]::IsNullOrEmpty($redirectUrl))
+            {
+                LogVerbose "Item in auxiliary archive, redirecting to: $redirectUrl"
+                Log "Item $itemId is in auxiliary archive mailbox, following redirect" Yellow
+                
+                # Retry the export with the redirect URL
+                $exportData = POST $redirectUrl $exportRequest
+                
+                if (!$exportData)
+                {
+                    Log "Failed to export item data from auxiliary archive for $itemId" Red
+                    return $null
+                }
+            }
+            else
+            {
+                Log "ErrorArchiveFolderMovedPermanently but no redirect URL provided for $itemId" Red
+                return $null
+            }
+        }
+    }
+    
     LogVerbose "Successfully exported item $itemId"
     
     # Return both metadata and export data
@@ -1306,8 +1366,10 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
                 $retryAfter = 0
                 $rateLimitReason = ""
                 $shouldRetry = $false
+                $isArchiveRedirect = $false
+                $redirectMailboxId = $null
                 
-                # Extract status code and check if it's a throttling error
+                # Extract status code and check if it's a throttling error or archive redirect
                 if ($_.Exception.Response)
                 {
                     try
@@ -1324,6 +1386,23 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
                         {
                             "" | out-file $script:traceFile -Append
                             "HTTP $statusCode $statusDescription" | out-file $script:traceFile -Append
+                        }
+                        
+                        # Check for HTTP 409 Conflict (archive mailbox redirect)
+                        if ($statusCode -eq 409 -and $_.ErrorDetails.Message)
+                        {
+                            $errorObj = $_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue
+                            if ($errorObj -and $errorObj.Message)
+                            {
+                                # Check if the error message indicates an archive redirect
+                                # Expected format: "Invalid import session. The target session is expected in mailbox MBX:..."
+                                if ($errorObj.Message -match "The target session is expected in mailbox (MBX:[^\s\.\)]+)")
+                                {
+                                    $redirectMailboxId = $matches[1]
+                                    $isArchiveRedirect = $true
+                                    Log "Target folder is in auxiliary archive mailbox: $redirectMailboxId" Yellow
+                                }
+                            }
                         }
                         
                         # Parse response headers (single loop for both extraction and logging)
@@ -1406,7 +1485,22 @@ function ImportItemToMailbox($targetMailbox, $folderId, $exportData)
                     }
                 }
                 
-                # Handle retry logic
+                # Handle archive mailbox redirect (HTTP 409)
+                if ($isArchiveRedirect -and $redirectMailboxId)
+                {
+                    Log "Recreating import session for auxiliary archive mailbox: $redirectMailboxId" Yellow
+                    
+                    if ($TraceGraphCalls)
+                    {
+                        "Detected auxiliary archive redirect, recreating import session..." | out-file $script:traceFile -Append
+                        "`r`n" | out-file $script:traceFile -Append
+                    }
+                    
+                    # Retry the entire import process with the correct mailbox ID
+                    return ImportItemToMailbox $redirectMailboxId $folderId $exportData
+                }
+                
+                # Handle retry logic for throttling
                 if ($shouldRetry -and $retryCount -lt $maxRetries)
                 {
                     $retryCount++
