@@ -1,7 +1,7 @@
 ﻿#
 # sendMail.ps1
 #
-# By David Barrett, Microsoft Ltd. 2022. Use at your own risk.  No warranties are given.
+# By David Barrett, Microsoft Ltd. Use at your own risk.  No warranties are given.
 #
 #  DISCLAIMER:
 # THIS CODE IS SAMPLE CODE. THESE SAMPLES ARE PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND.
@@ -14,7 +14,7 @@
 
 <#
 .SYNOPSIS
-Send a message (to self) using Graph sendMail.
+Send a message, optionally including an adaptive card using Graph sendMail.
 
 .DESCRIPTION
 This script demonstrates how to send an email using the Graph API.
@@ -30,7 +30,7 @@ mailbox.
 
 # Send adaptive card in message to self
 $cardContent = Get-Content "c:\temp\adaptiveCard.json" -Raw
-.\sendMail.ps1 -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -Mailbox $Mailbox -AdaptiveCardPayload $cardContent
+.\sendMail.ps1 -AppId $clientId -TenantId $tenantId -AppSecretKey $secretKey -Mailbox $Mailbox -AdaptiveCardPayload (Get-Content "c:\temp\adaptiveCard.json" -Raw)
 
 #>
 
@@ -195,7 +195,6 @@ if ($Recipient)
 $messagePayload = @{
     message = @{
         subject = "Test Message"
-        importance = "Low"
         body = @{
             contentType = $bodyContentType
             content = $bodyContent
